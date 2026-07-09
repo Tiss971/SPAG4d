@@ -134,3 +134,7 @@ static/js/three.min.js
 temp_spag4d/
 *.tmp
 *.temp
+
+# Depth-stability benchmark: heavy PLY point clouds (keep stats.json + comparison.png only)
+benchmark_depth_stability_mattswift/gaussians_*/
+benchmark_flow_prop_mattswift03_native/

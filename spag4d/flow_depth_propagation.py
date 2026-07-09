@@ -51,6 +51,7 @@ the previous frame's fused mask/depth and this frame's WAFT flow.
 
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -140,6 +141,58 @@ def pole_trust_mask(H: int, W: int, pole_margin_frac: float = 0.08) -> np.ndarra
         mask[:margin, :] = 0.0
         mask[H - margin :, :] = 0.0
     return mask
+
+
+def feather_dynamic_mask(
+    mask: np.ndarray, dilate_px: int = 12, feather_px: int = 9
+) -> np.ndarray:
+    """Turn a binary dynamic-object mask into a soft alpha map in [0, 1] for
+    seamless compositing of per-frame object depth over a locked background.
+
+    The mask is first dilated (to cover DA360's depth-bleed halo around moving
+    edges and any 1-frame lag in the mask) then Gaussian-blurred so the
+    background<->object depth transition has no hard seam. Both operations are
+    done with circular horizontal padding so an object straddling the ERP seam
+    is handled correctly.
+    """
+    H, W = mask.shape
+    pad = max(dilate_px + feather_px, 1)
+    m = (mask > 0).astype(np.uint8) * 255
+    m = np.concatenate([m[:, -pad:], m, m[:, :pad]], axis=1)  # wrap-pad seam
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
+        m = cv2.dilate(m, k)
+    alpha = m.astype(np.float32) / 255.0
+    if feather_px > 0:
+        ksz = 2 * feather_px + 1
+        alpha = cv2.GaussianBlur(alpha, (ksz, ksz), 0)
+    return alpha[:, pad : pad + W]
+
+
+def composite_bg_locked(
+    object_depth: np.ndarray,
+    depth_ref: np.ndarray,
+    dynamic_mask: np.ndarray,
+    dilate_px: int = 12,
+    feather_px: int = 9,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fixed-camera depth compositing.
+
+    The camera never moves, so every pixel outside a moving object is, by
+    construction, static background whose true depth is *constant in time* and
+    already known artifact-free from the reference depth `depth_ref` (DA360 on
+    the temporal-median background). Re-estimating that depth every frame — and
+    then affine- or flow-correcting it — only reintroduces monocular noise as
+    temporal flicker. So we don't: static pixels are locked to `depth_ref`
+    (exactly zero temporal variance), and the fresh per-frame `object_depth`
+    (ideally already flow-propagated for temporal coherence) is used *only*
+    inside the feathered dynamic mask, where the scene genuinely changes.
+
+    Returns (depth_final, alpha) where alpha is the soft object weight in [0,1].
+    """
+    alpha = feather_dynamic_mask(dynamic_mask, dilate_px, feather_px)
+    depth_final = alpha * object_depth + (1.0 - alpha) * depth_ref
+    return np.clip(depth_final, 0.0, None), alpha
 
 
 @dataclass
