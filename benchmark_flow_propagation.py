@@ -23,7 +23,9 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 
+from spag4d.core import SPAG4D
 from spag4d.da360_model import DA360Model
 from spag4d.detect_opticalflow import WAFTWrapper
 from spag4d.flow_depth_propagation import (
@@ -31,7 +33,23 @@ from spag4d.flow_depth_propagation import (
     compute_bidirectional_flow,
     propagate_depth_via_flow,
 )
-from spag4d.video import align_depth_frame, extract_video_frames
+from spag4d.ply_writer import save_ply_gsplat
+from spag4d.video import align_depth_frame, extract_video_frames, to_gaussians
+
+
+def downscale_frames(frames: np.ndarray, max_size: int) -> np.ndarray:
+    """Downscale (N,H,W,3) uint8 so the longest side <= max_size. 4K ERP
+    sources would otherwise make WAFT/DA360 inference far slower than needed
+    — DA360 resizes to 518x1036 internally regardless of input resolution,
+    so working below ~1024-1536px loses no real depth detail."""
+    H, W = frames.shape[1:3]
+    scale = min(max_size / max(H, W), 1.0)
+    if scale >= 1.0:
+        return frames
+    new_H, new_W = int(H * scale) & ~1, int(W * scale) & ~1
+    t = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
+    t = F.interpolate(t, size=(new_H, new_W), mode="bilinear", align_corners=False)
+    return t.permute(0, 2, 3, 1).byte().numpy()
 
 
 def main():
@@ -44,6 +62,20 @@ def main():
     parser.add_argument("--seam-pad", type=int, default=64)
     parser.add_argument("--fb-err-threshold", type=float, default=1.5)
     parser.add_argument("--pole-margin-frac", type=float, default=0.08)
+    parser.add_argument(
+        "--work-max-size", type=int, default=1024,
+        help="Downscale longest side to this before any compute (flow/depth/PLY). "
+             "4K sources (3840px+) are otherwise far slower than needed for this comparison.",
+    )
+    parser.add_argument(
+        "--ply-stride", type=int, default=8,
+        help="Spatial stride for gaussian generation (1 gaussian per stride^2 px). "
+             "Keep high (8+) at 4K-derived working resolutions to avoid huge PLYs.",
+    )
+    parser.add_argument(
+        "--ply-export-count", type=int, default=6,
+        help="Number of evenly-spaced frames to export as PLY (both methods), 0 to disable.",
+    )
     parser.add_argument(
         "--da360-weights", type=str, default=str(Path.home() / ".cache/spag4d/DA360_large.pth")
     )
@@ -60,9 +92,11 @@ def main():
     print("[1/5] Extracting frames...")
     frames, meta = extract_video_frames(args.video, skip_step=args.skip_step)
     frames = frames[: args.max_frames]
+    native_H, native_W = frames.shape[1:3]
+    frames = downscale_frames(frames, args.work_max_size)
     n = len(frames)
     frames_rgb = frames[:, :, :, ::-1].copy()  # BGR -> RGB, for DA360
-    print(f"  {n} frames | {meta['W']}x{meta['H']}")
+    print(f"  {n} frames | native {native_W}x{native_H} -> working {frames.shape[2]}x{frames.shape[1]}")
 
     print("[2/5] Loading models...")
     da360 = DA360Model.load(model_path=args.da360_weights, device=device)
@@ -114,6 +148,13 @@ def main():
     depth_prev_final = None
     debug_saved = False
 
+    ply_frames = set()
+    if args.ply_export_count > 0 and n > 0:
+        ply_frames = set(np.linspace(0, n - 1, min(args.ply_export_count, n), dtype=int).tolist())
+        (out / "gaussians_affine").mkdir(exist_ok=True)
+        (out / "gaussians_propagated").mkdir(exist_ok=True)
+        converter = SPAG4D(device="cuda", generator="pager")  # generator="pager" avoids eager-loading DA360 (already loaded above)
+
     for idx in range(n):
         frame_tensor = torch.from_numpy(frames_rgb[idx]).to(device)
         with torch.inference_mode():
@@ -146,6 +187,17 @@ def main():
                 debug_saved = True
 
         depth_prev_final = depth_final
+
+        if idx in ply_frames:
+            H_i, W_i, _ = frame_tensor.shape
+            for tag, depth_map in (("affine", depth_affine), ("propagated", depth_final)):
+                gaussians = to_gaussians(converter, depth_map, frame_tensor, args.ply_stride, H_i)
+                save_ply_gsplat(
+                    gaussians,
+                    str(out / f"gaussians_{tag}" / f"frame_{idx}.ply"),
+                    sh_degree=0,
+                    colors_linear=False,
+                )
 
         fg = fused_mask > 0
         if fg.sum() > 0:
@@ -194,6 +246,8 @@ def main():
     print(f"Affine alignment  — mean temporal std over FG pixels: {stats['affine_fg_temporal_std_mean']:.4f} m")
     print(f"Flow propagation  — mean temporal std over FG pixels: {stats['propagated_fg_temporal_std_mean']:.4f} m")
     print(f"Saved: {out}/stats.json, {out}/comparison.png")
+    if ply_frames:
+        print(f"PLYs (stride={args.ply_stride}): {out}/gaussians_affine/, {out}/gaussians_propagated/")
 
 
 if __name__ == "__main__":

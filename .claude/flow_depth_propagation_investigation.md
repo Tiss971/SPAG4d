@@ -80,38 +80,56 @@ on réutilise directement `D_ref` plutôt qu'une estimation monoculaire fraîche
 - `benchmark_flow_propagation.py` (racine, même style que
   `benchmark_realistic.py`) — script de comparaison empirique, autonome
   (masque foreground approximé par seuillage de la magnitude du flow WAFT,
-  pas besoin de SAM3), qui calcule pour chaque frame :
+  pas besoin de SAM3). Gère les sources 4K : `--work-max-size` (défaut 1024)
+  downscale tout de suite après extraction — DA360 redimensionne de toute
+  façon en interne à 518×1036, donc travailler à 4K n'ajoute aucun détail de
+  profondeur réel, juste du temps de calcul WAFT/DA360. Export PLY optionnel
+  (`--ply-export-count`, `--ply-stride`) pour quelques frames espacées
+  régulièrement, avec un stride spatial élevé (défaut 8) pour garder des
+  fichiers gérables à ces résolutions de travail. Calcule pour chaque frame :
   - la depth actuelle (`align_depth_frame`, méthode en prod),
   - la depth propagée par flow (ce prototype),
   et compare l'écart-type temporel sur les pixels foreground (proxy direct du
   scintillement, même métrique que `_temporal_depth_std.jpg` déjà utilisée
   dans le pipeline).
 
-## Résultat empirique (préliminaire)
+## Résultat empirique
 
-Testé sur `temp_fast_track_h264.mp4` (1024×512 ERP, 75 frames @ 30fps, scène
-d'entrepôt) :
+| Vidéo | Résolution native | Contenu | Std temporel — affine (actuel) | Std temporel — flow prop. (prototype) | Gain |
+|---|---|---|---|---|---|
+| `temp_fast_track_h264.mp4` | 1024×512 | Entrepôt, ~statique | 0.497 m | 0.445 m | ~11% |
+| `accident_electrique_fast5.mp4` | 3840×1920 (4K) | Entrepôt, ~statique | 0.598 m | 0.511 m | ~15% |
+| `MattSwift_03.mp4` | 2048×1024 | **2 personnes assises, gestes de la main** | 0.299 m | 0.213 m | ~29% |
 
-| Méthode | Écart-type temporel moyen (pixels foreground) |
-|---|---|
-| Alignement affine (actuel) | 0.497 m |
-| Propagation par flow (prototype) | 0.445 m |
+(toutes les 3 tournées avec `--work-max-size 1024`, downscale WAFT/DA360
+appliqué avant tout calcul — cf. section précédente.)
 
-→ **~11% de réduction du bruit temporel** sur les pixels foreground, et la
-courbe de profondeur médiane du foreground est visiblement plus lisse (moins
-de pics ponctuels frame-à-frame — voir `benchmark_flow_prop/comparison.png`).
+Les deux premières vidéos n'ont pas de sujet clairement mobile : le masque
+foreground (seuillage flow) ne capte qu'un petit cluster de bruit/flicker
+(`_debug_fg_mask.jpg` dans chaque dossier de sortie), pas un objet qui
+traverse la scène — ces deux chiffres mesurent donc surtout un lissage du
+bruit de fond du monoculaire, pas un vrai cas d'usage.
 
-**Limite importante de ce test** : `temp_fast_track_h264.mp4` ne contient pas
-de sujet clairement mobile — le masque foreground (seuillage flow) ne capte
-qu'un petit cluster de bruit/flicker (`_debug_fg_mask.jpg`), pas un objet
-traversant la scène. Le chiffre ci-dessus mesure donc surtout un
-**lissage du bruit de fond du monoculaire**, pas encore un cas d'usage réel
-(personne qui marche, objet qui bouge). **Prochaine étape recommandée avant
-d'intégrer** : rejouer ce même benchmark sur une vidéo avec un vrai sujet en
-mouvement (et idéalement les masques SAM3 réels plutôt que le proxy par
-seuillage de flow) pour confirmer que le gain se maintient — et surtout pour
-vérifier le comportement aux limites (objet traversant la couture ERP, objet
-s'approchant radialement de la caméra) qui ne sont pas exercées par ce clip.
+**`MattSwift_03.mp4` est le test qui compte** : la scène montre deux personnes
+assises qui discutent, avec des gestes de main détectés par le masque flow.
+Sur `comparison.png` de ce run, la courbe orange (alignement affine actuel)
+présente des décrochages catastrophiques et ponctuels — jusqu'à **0.05 m**
+autour de la frame 119, plusieurs chutes sous 1 m ailleurs — typiques d'une
+frame où l'estimation monoculaire brute dérape et où le recalage affine (basé
+sur un petit nombre de pixels statiques) ne suffit pas à corriger. La courbe
+verte (propagation par flow) ignore complètement ces décrochages et reste
+dans une plage cohérente (~1.5–3.5 m) sur toute la séquence : c'est
+exactement le mode de défaillance que la propagation par flow est censée
+éliminer — un pixel dont l'estimation monoculaire ponctuelle est aberrante
+hérite quand même d'un prior temporel stable tant que le flow le suit
+correctement.
+
+**Limite restante** : le masque foreground reste un proxy (seuillage flow),
+pas les masques SAM3 réels. Aucune de ces 3 vidéos n'exerce non plus les cas
+limites propres à l'ERP (objet qui traverse la couture, sujet qui s'approche
+radialement de la caméra) — à vérifier avant intégration en production, mais
+le mécanisme central (rejet des décrochages ponctuels du monoculaire) est
+maintenant validé sur un sujet réellement mobile.
 
 ## Plan d'intégration dans `video.py` (si validé)
 
