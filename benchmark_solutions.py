@@ -176,6 +176,8 @@ def main():
                     help="comma-separated config names, or 'all'")
     ap.add_argument("--video-dir", default=DEFAULT_VIDEO_DIR)
     ap.add_argument("--output", default="./benchmark_solutions")
+    ap.add_argument("--summary-name", default="SUMMARY.json",
+                    help="per-process summary filename (avoids races when parallelizing)")
     args = ap.parse_args()
 
     videos = find_videos(args.video_dir)
@@ -200,7 +202,7 @@ def main():
         summary[cname] = aggregate(res)
 
     # Write / update global summary
-    summary_path = output_base / "SUMMARY.json"
+    summary_path = output_base / args.summary_name
     existing = {}
     if summary_path.exists():
         existing = json.loads(summary_path.read_text())
