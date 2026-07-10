@@ -310,6 +310,17 @@ def run_video(
     sparse_pruning: float = 0.1,  # 0.3,
     depth_preview_path: Path | None = None,
     temporal_consistency: bool = False,
+    # --- Solution 1: temporal depth smoothing ---
+    depth_smoothing: bool = False,
+    depth_smoothing_window: int = 5,
+    depth_smoothing_method: str = "median",  # "median" | "gaussian"
+    # --- Solution 4: multi-frame depth reference ---
+    reference_frames_for_median: int = 1,
+    # --- Solution 6: foreground stabilizer tuning ---
+    fg_buffer_size: int = 21,
+    fg_jump_threshold: float = 0.5,
+    # --- Solution 5: mask quality diagnostics (diagnostic only) ---
+    mask_diagnostics: bool = False,
 ):
     """
 
@@ -374,6 +385,22 @@ def run_video(
             outputs_per_frame = segment_with_flows(str(video_path), output_folder, waft_frames, flow_masks, meta, n_total_frames, skip_step)
         print(f"[SPAG4D] Background/Front segmentation of video completed in {(time.time() - startsam):.2f}s")
 
+    # Solution 5: mask quality diagnostics (diagnostic only, no pipeline change)
+    if mask_diagnostics:
+        try:
+            from .analyze_mask_quality import analyze_mask_quality
+            _fh, _fw = viz_frames.shape[1], viz_frames.shape[2]
+            analyze_mask_quality(
+                flow_masks=flow_masks,
+                outputs_per_frame=outputs_per_frame,
+                n_frames=n_total_frames,
+                skip_step=skip_step,
+                target_hw=(_fh, _fw),
+                output_dir=output_folder / "mask_diagnostics",
+            )
+        except Exception as e:
+            print(f"[MaskDiag] failed: {e}")
+
 
     # On récup un background fixe
     if get_background_method == "temporal_median":
@@ -405,6 +432,23 @@ def run_video(
     with torch.inference_mode():
         # Use temporal_consistency mode (if requested) for consistent scaling across frames
         depth_raw, _ = depth_engine.predict(reference_bg, temporal_consistency=temporal_consistency)
+
+        # Solution 4: multi-frame depth reference.
+        # Instead of a single reference depth (from the temporal-median background),
+        # use the temporal median of depth predictions over N evenly-spaced frames.
+        # More robust to a noisy/atypical single reference.
+        if reference_frames_for_median and reference_frames_for_median > 1:
+            n_ref = min(reference_frames_for_median, n_total_frames)
+            ref_indices = np.linspace(0, n_total_frames - 1, n_ref).astype(int)
+            ref_depths = []
+            for ridx in ref_indices:
+                rframe = torch.from_numpy(viz_frames[ridx].copy()).to("cuda")
+                rdepth, _ = depth_engine.predict(rframe, temporal_consistency=temporal_consistency)
+                ref_depths.append(rdepth.cpu().numpy())
+            depth_raw_np_median = np.median(np.stack(ref_depths, axis=0), axis=0)
+            depth_raw = torch.from_numpy(depth_raw_np_median).to(depth_raw.device)
+            print(f"[SPAG4D] Solution 4: reference depth = median of {n_ref} frames "
+                  f"(indices {list(ref_indices)})")
 
     # Calculate scale factor to normalize median depth to ~5m (single time, for all frames)
     depth_median = float(depth_raw.median())
@@ -573,13 +617,59 @@ def run_video(
             delta = abs(current - baseline)
             if delta <= self.jump_threshold or current <= 0:
                 return depth
-            print(baseline / current)
             scale = np.clip(baseline / current, *self.scale_clip)
             out = depth.copy()
             out[fg] *= scale
             return out
 
-    fg_stabilizer = FGDepthStabilizer2(buffer_size=21, jump_threshold=0.5)
+    # Solution 6: FG stabilizer parameters are now configurable (tuning benchmark).
+    fg_stabilizer = FGDepthStabilizer2(
+        buffer_size=fg_buffer_size, jump_threshold=fg_jump_threshold
+    )
+
+    class TemporalDepthSmoother:
+        """
+        Solution 1: temporal depth smoothing.
+
+        Causal per-pixel smoothing of aligned depth maps over a sliding window
+        of the last `window` frames. Reduces frame-to-frame jitter on regions
+        whose depth should be steady, at the cost of a small lag on real motion.
+
+        method:
+            "median"   -> per-pixel median over the window (robust to spikes)
+            "gaussian" -> per-pixel Gaussian-weighted average (recent frames
+                          weighted highest)
+        """
+
+        def __init__(self, window: int = 5, method: str = "median"):
+            self.window = max(1, int(window))
+            self.method = method
+            self.buffer = deque(maxlen=self.window)
+            if method == "gaussian":
+                sigma = max(self.window / 6.0, 1e-3)
+                # weights over the causal window; index 0 = oldest, -1 = current
+                offsets = np.arange(self.window - 1, -1, -1, dtype=np.float64)
+                w = np.exp(-(offsets ** 2) / (2 * sigma ** 2))
+                self._full_weights = w / w.sum()
+
+        def __call__(self, depth: np.ndarray) -> np.ndarray:
+            self.buffer.append(depth)
+            if len(self.buffer) == 1:
+                return depth
+            stack = np.stack(self.buffer, axis=0)  # [k, H, W]
+            if self.method == "median":
+                return np.median(stack, axis=0)
+            # gaussian: use the tail of the full weight vector matching buffer len
+            k = stack.shape[0]
+            w = self._full_weights[-k:]
+            w = w / w.sum()
+            return np.tensordot(w, stack, axes=([0], [0]))
+
+    depth_smoother = (
+        TemporalDepthSmoother(depth_smoothing_window, depth_smoothing_method)
+        if depth_smoothing
+        else None
+    )
 
     (output_folder / "gaussians").mkdir(parents=True, exist_ok=True)
     n_gaussians = []
@@ -626,6 +716,10 @@ def run_video(
             aligned_depth_np = align_depth_frame(
                 depth_np, depth_ref_np, fused_mask, alignement_method, verbose=True
             ).copy()
+        # Solution 1: temporal depth smoothing (causal window) on the aligned depth,
+        # applied before FG stabilization / Gaussian generation.
+        if depth_smoother is not None:
+            aligned_depth_np = depth_smoother(aligned_depth_np)
         aligned_median_depth_fg.append(float(np.median(aligned_depth_np[fused_mask > 0])))
 
         # Background depth metrics (NEW): median depth of static regions
