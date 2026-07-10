@@ -6,8 +6,8 @@ import os
 import shutil
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 import torch
 from PIL import Image
@@ -19,14 +19,14 @@ def convert_unisharp360(
     input_path: str,
     output_path: str,
     device: torch.device,
-    unisharp_repo: Optional[str],
-    unisharp_python: Optional[str] = None,
-    checkpoint_path: Optional[str] = None,
+    unisharp_repo: str | None,
+    unisharp_python: str | None = None,
+    checkpoint_path: str | None = None,
     scale_align: str = "global",
     format_mode: str = "copy",
     save_debug: bool = False,
-    raw_output_dir: Optional[str] = None,
-    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    raw_output_dir: str | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict:
     t0 = time.time()
 
@@ -81,7 +81,7 @@ def convert_unisharp360(
         # This is required on platforms where gsplat's CUDA op cannot build
         # (e.g. native Windows) and is faster everywhere. Requires a UniSHARP
         # repo patched to accept --no-render; leave the env var unset otherwise.
-        extra_args = ["--no-render"] if os.environ.get("SPAG4D_UNISHARP_NO_RENDER") else None
+        extra_args = ["--no-render", "True"] # if os.environ.get("SPAG4D_UNISHARP_NO_RENDER") else None
 
         from .unisharp_adapter import run_unisharp_inference
         run = run_unisharp_inference(
@@ -103,8 +103,8 @@ def convert_unisharp360(
 
         # ---- format handling ---------------------------------------------
         from .unisharp_format import (
-            copy_unisharp_ply_to_output,
             convert_unisharp_ply_to_spag,
+            copy_unisharp_ply_to_output,
         )
         if format_mode == "copy":
             stats = copy_unisharp_ply_to_output(str(raw_ply), str(out_path))

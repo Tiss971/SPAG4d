@@ -424,7 +424,7 @@ def prune_grazing_angle(
     r = np.linalg.norm(means, axis=1)
     y = means[:, 1]
     phi = np.arccos(np.clip(y / np.maximum(r, 1e-8), -1, 1))  # [0, pi]
-    theta = np.arctan2(-means[:, 2], means[:, 0])  # [-pi, pi]
+    theta = np.arctan2(means[:, 2], means[:, 0])  # [-pi, pi]
     theta = theta % (2 * np.pi)  # [0, 2pi]
 
     # Map to pixel coordinates
@@ -533,10 +533,57 @@ def prune_sparse_regions(
     return pruned
 
 
+def compute_pruning_thresholds(
+    gaussians: dict,
+    k: int = 16,
+    stride: int = 2,
+) -> dict:
+    """
+    C2 FIX: Compute pruning thresholds ONCE from a reference set (e.g., background).
+    These thresholds are then reused across all frames for consistency.
+
+    Args:
+        gaussians: Reference Gaussian dict (e.g., background)
+        k: Number of nearest neighbors for outlier detection
+        stride: Stride for grazing angle filter
+
+    Returns:
+        dict with keys: "outlier_threshold", "grazing_distances", "sparse_distances"
+    """
+    import numpy as np
+
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return None
+
+    means_np = gaussians['means'].detach().cpu().numpy()
+    tree = cKDTree(means_np)
+
+    # Outlier threshold (based on k-NN distances)
+    distances, _ = tree.query(means_np, k=k + 1, workers=-1)
+    avg_distances = np.mean(distances[:, 1:], axis=1)
+    global_mean = np.mean(avg_distances)
+    global_std = np.std(avg_distances)
+    outlier_threshold = global_mean + (global_std * 1.5)  # Fixed std_ratio
+
+    # Sparse region threshold (based on k-NN for radius check)
+    sparse_distances, _ = tree.query(means_np, k=8, workers=-1)
+    sparse_threshold = np.mean(sparse_distances[:, -1]) * 3.0  # Fixed multiplier
+
+    return {
+        "outlier_threshold": float(outlier_threshold),
+        "outlier_mean": float(global_mean),
+        "outlier_std": float(global_std),
+        "sparse_threshold": float(sparse_threshold),
+    }
+
+
 def prune_outliers(
     gaussians: dict,
     strength: float = 0.5,
     k: int = 16,
+    outlier_threshold: float | None = None,
 ) -> dict:
     """
     Remove isolated Gaussians (floaters) using Statistical Outlier Removal (SOR).
@@ -560,28 +607,21 @@ def prune_outliers(
         warnings.warn("scipy not installed. Skipping outlier pruning.")
         return gaussians
 
-    means_np = gaussians['means'].detach().cpu().numpy()
-    tree = cKDTree(means_np)
-    
-    # Query distances to k nearest neighbors (k+1 because the point itself is included at dist=0)
-    # n_jobs=-1 uses all CPU cores
-    distances, _ = tree.query(means_np, k=k + 1, workers=-1)
-    
-    # Average distance to neighbors (excluding the point itself)
-    avg_distances = np.mean(distances[:, 1:], axis=1)
-    
-    # Compute global mean and std
-    global_mean = np.mean(avg_distances)
-    global_std = np.std(avg_distances)
-    
-    # Mapping strength (0.0 - 1.0) to std_ratio (3.0 to 0.5)
-    # std_ratio defines how many standard deviations away from the mean is acceptable.
-    # lower std_ratio = more aggressive pruning.
-    # strength=0.0 -> std_ratio=3.0 (mild)
-    # strength=1.0 -> std_ratio=0.5 (aggressive)
-    std_ratio = 3.0 - (strength * 2.5) 
-    
-    threshold = global_mean + (global_std * std_ratio)
+    # C2 FIX: Use pre-calculated threshold if provided (for temporal consistency)
+    if outlier_threshold is not None:
+        threshold = outlier_threshold
+    else:
+        means_np = gaussians['means'].detach().cpu().numpy()
+        tree = cKDTree(means_np)
+
+        distances, _ = tree.query(means_np, k=k + 1, workers=-1)
+        avg_distances = np.mean(distances[:, 1:], axis=1)
+
+        global_mean = np.mean(avg_distances)
+        global_std = np.std(avg_distances)
+
+        std_ratio = 3.0 - (strength * 2.5)
+        threshold = global_mean + (global_std * std_ratio)
     
     # Keep points whose average distance is below the threshold
     keep_mask_np = avg_distances < threshold

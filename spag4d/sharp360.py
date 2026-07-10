@@ -18,9 +18,9 @@ import logging
 import math
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -71,7 +71,7 @@ class ExtractionLayout:
     """Describes a set of perspective views to extract from an ERP panorama."""
 
     name: str
-    views: List[FaceOrientation]
+    views: list[FaceOrientation]
     focal_px: float      # horizontal focal length in pixels
     focal_y_px: float    # vertical focal length in pixels
     image_width: int
@@ -205,7 +205,7 @@ def build_extraction_layout(
 def build_cap_layout(
     face_size: int,
     cap_fov_degrees: float = 125.0,
-    poles: Tuple[str, ...] = ("nadir", "zenith"),
+    poles: tuple[str, ...] = ("nadir", "zenith"),
 ) -> ExtractionLayout:
     """Build a layout of square pole-cap views (nadir/zenith).
 
@@ -351,7 +351,7 @@ def _pixel_ray_directions(
     focal_x_px: float,
     focal_y_px: float,
     view: FaceOrientation,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute world-frame ray directions for every pixel in a perspective view.
 
     Returns (world_x, world_y, world_z) each of shape (image_height, image_width).
@@ -383,7 +383,7 @@ def _world_to_erp_pixels(
     world_z: np.ndarray,
     erp_width: int,
     erp_height: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Convert world-frame direction vectors to ERP pixel coordinates.
 
     Uses the convention from SHARP_360_to_Splat:
@@ -436,13 +436,13 @@ def extract_perspective_view(
 def extract_perspective_views(
     layout: ExtractionLayout,
     panorama: np.ndarray,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Extract all perspective faces from an ERP panorama.
 
     Returns:
         Dict mapping view name to (H, W, 3) uint8 face image.
     """
-    faces: Dict[str, np.ndarray] = {}
+    faces: dict[str, np.ndarray] = {}
     for view in layout.views:
         face = extract_perspective_view(
             panorama,
@@ -488,10 +488,10 @@ def extract_perspective_scalar_view(
 # ---------------------------------------------------------------------------
 
 def filter_gaussians_by_view_border(
-    gaussians: "Gaussians3D",
+    gaussians: Gaussians3D,
     horizontal_degrees: float,
     vertical_degrees: float = None,
-) -> "Gaussians3D":
+) -> Gaussians3D:
     """Hard Voronoi clipping: keep Gaussians within a horizontal angular strip.
 
     Clips **horizontally only** by default (matching SHARP_360_to_Splat
@@ -540,9 +540,9 @@ def filter_gaussians_by_view_border(
 
 
 def filter_gaussians_by_cone(
-    gaussians: "Gaussians3D",
+    gaussians: Gaussians3D,
     half_angle_degrees: float,
-) -> "Gaussians3D":
+) -> Gaussians3D:
     """Hard Voronoi clipping for a pole-cap face: keep Gaussians whose view-local
     direction is within ``half_angle_degrees`` of the forward (+Z / pole) axis.
 
@@ -575,14 +575,14 @@ def filter_gaussians_by_cone(
 
 
 def align_gaussians_to_reference(
-    gaussians: "Gaussians3D",
+    gaussians: Gaussians3D,
     ref_disparity_view: np.ndarray,
     focal_x_px: float,
     focal_y_px: float,
     image_width: int,
     image_height: int,
     grid_resolution: int = 8,
-) -> "Gaussians3D":
+) -> Gaussians3D:
     """Align Gaussian depths to a DA360 reference disparity via a smooth
     NxN grid scale field.
 
@@ -709,9 +709,9 @@ def align_gaussians_to_reference(
 
 
 def scale_gaussians(
-    gaussians: "Gaussians3D",
+    gaussians: Gaussians3D,
     scale_factor: float,
-) -> "Gaussians3D":
+) -> Gaussians3D:
     """Uniformly scale Gaussian positions and singular values."""
     from sharp.utils.gaussians import Gaussians3D as _G3D
 
@@ -725,8 +725,8 @@ def scale_gaussians(
 
 
 def merge_gaussians(
-    gaussians_list: List["Gaussians3D"],
-) -> "Gaussians3D":
+    gaussians_list: list[Gaussians3D],
+) -> Gaussians3D:
     """Concatenate a list of Gaussians3D into one (along N dimension).
 
     All inputs must have batch dim 1, i.e. shape (1, N_i, D).
@@ -764,7 +764,8 @@ def predict_da360_disparity(
         (H, W) float32 disparity map (higher = closer).
     """
     import torch.nn.functional as F
-    from .da360_model import DA360Model, DA360_INPUT_H, DA360_INPUT_W
+
+    from .da360_model import DA360_INPUT_H, DA360_INPUT_W, DA360Model
 
     LOGGER.info("Loading DA360 model...")
     da360_model = DA360Model.load(device=device)
@@ -832,8 +833,8 @@ def _load_sharp_predictor(device: torch.device):
     Returns:
         (predictor, device) tuple.
     """
-    from sharp.models import PredictorParams, create_predictor
     from sharp.cli.predict import DEFAULT_MODEL_URL
+    from sharp.models import PredictorParams, create_predictor
 
     LOGGER.info("Loading SHARP predictor (auto-download if needed)...")
     state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
@@ -860,8 +861,8 @@ def _process_face(
     da360_disparity: np.ndarray,
     predictor,
     device: torch.device,
-    clip_fn: Callable[["Gaussians3D"], "Gaussians3D"],
-) -> Tuple[Optional["Gaussians3D"], Optional[float]]:
+    clip_fn: Callable[[Gaussians3D], Gaussians3D],
+) -> tuple[Gaussians3D | None, float | None]:
     """SHARP-predict one face, clip it, DA360-align it, and rotate to world frame.
 
     Returns ``(world_gaussians, pre_alignment_median_radius)`` or ``(None, None)``
@@ -910,20 +911,20 @@ def convert_sharp360(
     side_count: int = 6,
     overlap_degrees: float = 10.0,
     seedvr2_upscale: bool = False,
-    seedvr2_config: Optional["SeedVR2Config"] = None,
-    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    seedvr2_config: SeedVR2Config | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
     include_caps: bool = True,
     cap_fov_degrees: float = 125.0,
     seam_latitude_degrees: float = 30.0,
     # --- new: backend selection ---
     backend: str = "sharp",
-    unisharp_repo: Optional[str] = None,
-    unisharp_python: Optional[str] = None,
-    unisharp_checkpoint: Optional[str] = None,
+    unisharp_repo: str | None = 'third_party/UniSHARP',
+    unisharp_python: str | None = None,
+    unisharp_checkpoint: str | None = None,
     unisharp_scale_align: str = "global",
-    unisharp_format_mode: str = "copy",
+    unisharp_format_mode: str = "convert",
     unisharp_save_debug: bool = False,
-    unisharp_raw_output_dir: Optional[str] = None,
+    unisharp_raw_output_dir: str | None = None,
 ) -> dict:
     """Full SHARP 360 pipeline: ERP panorama -> merged 3DGS PLY.
 
@@ -971,8 +972,7 @@ def convert_sharp360(
 
     # backend == "sharp": existing per-face pipeline (below), untouched.
     from PIL import Image
-    from sharp.cli.predict import predict_image
-    from sharp.utils.gaussians import Gaussians3D, apply_transform, save_ply
+    from sharp.utils.gaussians import Gaussians3D, save_ply
 
     def _progress(stage: str, cur: int, total: int):
         if progress_callback is not None:
@@ -1021,7 +1021,7 @@ def convert_sharp360(
     # Pole caps (nadir/zenith) close the holes the horizon ring leaves at the
     # poles. Square wide-FOV faces that overlap the horizon faces' vertical edge.
     cap_layout = None
-    cap_faces: Dict[str, np.ndarray] = {}
+    cap_faces: dict[str, np.ndarray] = {}
     if include_caps:
         cap_layout = build_cap_layout(face_size=face_size, cap_fov_degrees=cap_fov_degrees)
         cap_faces = extract_perspective_views(cap_layout, panorama)
@@ -1094,8 +1094,8 @@ def convert_sharp360(
     horizon_vertical_clip = 2.0 * seam_latitude_degrees if include_caps else None
     cap_half_angle = 90.0 - seam_latitude_degrees  # cone half-angle around the pole
 
-    all_gaussians: List[Gaussians3D] = []
-    original_median_radii: List[float] = []
+    all_gaussians: list[Gaussians3D] = []
+    original_median_radii: list[float] = []
 
     total_faces = side_count + (len(cap_faces) if cap_faces else 0)
     done = 0

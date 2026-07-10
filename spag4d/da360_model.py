@@ -164,7 +164,9 @@ class DA360Model:
     def predict(
         self,
         image: torch.Tensor,
-        return_mask: bool = False
+        return_mask: bool = False,
+        global_scale_factor: float | None = None,
+        temporal_consistency: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Predict depth from equirectangular image.
@@ -175,6 +177,10 @@ class DA360Model:
         Args:
             image: RGB tensor [H, W, 3] or [B, H, W, 3], uint8 or [0,1] float
             return_mask: Ignored (DA360 doesn't produce masks)
+            global_scale_factor: if provided, use this fixed scale for temporal consistency.
+                                 if None with temporal_consistency=False, rescale each frame independently.
+            temporal_consistency: if True, disable per-frame rescaling (caller handles scale).
+                                 if False (default), rescale each frame to ~5m median.
 
         Returns:
             Tuple of (depth, None):
@@ -223,12 +229,19 @@ class DA360Model:
         eps = 1e-6
         depth = 1.0 / (disparity.abs() + eps)
 
-        # Median-based scale normalization to approximate metric depth
-        # Set median depth to ~5m (reasonable indoor/outdoor midpoint)
-        for i in range(B):
-            median_depth = depth[i].median()
-            if median_depth > eps:
-                depth[i] = depth[i] * (5.0 / median_depth)
+        # Scale normalization to approximate metric depth
+        if temporal_consistency or global_scale_factor is not None:
+            # Temporal consistency mode (video): either use fixed scale or no per-frame normalization
+            if global_scale_factor is not None:
+                depth = depth * global_scale_factor
+            # else: return raw depth (caller will handle scaling)
+        else:
+            # Per-frame normalization (single-image mode): set median depth to ~5m each frame
+            # WARNING: this causes scale drift between consecutive frames in videos
+            for i in range(B):
+                median_depth = depth[i].median()
+                if median_depth > eps:
+                    depth[i] = depth[i] * (5.0 / median_depth)
 
         # Upsample to original resolution
         if depth.shape[-2] != H or depth.shape[-1] != W:

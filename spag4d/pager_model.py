@@ -127,11 +127,13 @@ class PaGeRModel:
         return {h for h in _SCALE_HEADS.values() if h != keep}, True
 
     @torch.inference_mode()
-    def predict(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def predict(self, image: torch.Tensor, global_scale_factor: float | None = None, temporal_consistency: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """image: (H,W,3) uint8/float on device. Returns (depth, sky_mask).
 
         depth: (H,W) float32 radial/Euclidean ERP depth at working resolution.
         sky_mask: (H,W) bool (sigmoid(sky logits) > 0.5).
+        global_scale_factor: if provided, rescale depth by this factor (temporal consistency).
+        temporal_consistency: if True, disable per-frame CLIP-based scaling (caller handles scale).
         Side-effects: self.last_normals (H,W,3) world-frame unit; native_resolution.
         """
         if image.dtype == torch.uint8:
@@ -145,6 +147,10 @@ class PaGeRModel:
         cube = cube.unsqueeze(0).to(self.device)              # (1,6,3,face,face)
 
         skip, use_scale = self._skip_heads(cube)
+        # Temporal consistency mode: disable per-frame CLIP-based scaling
+        if temporal_consistency:
+            skip = {"scale_indoor", "scale_outdoor"}
+            use_scale = False
         pred = self._pager(cube, dtype=torch.float16, skip_heads=skip)
 
         log_scale = pred.get("scale") if use_scale else None
@@ -173,5 +179,9 @@ class PaGeRModel:
         if sky_prob_erp.dim() == 3:
             sky_prob_erp = sky_prob_erp[0]                    # (1,H,W) -> (H,W)
         sky_mask = (sky_prob_erp > 0.5).bool()
+
+        # Apply global scale factor if provided (temporal consistency in video mode)
+        if global_scale_factor is not None:
+            depth = depth * global_scale_factor
 
         return depth, sky_mask
