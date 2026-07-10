@@ -27,12 +27,16 @@ RELEVANT = {
 }
 
 
-def aggregate(results):
+def aggregate(results, allowed_videos=None):
+    """Aggregate stability metrics. If allowed_videos is given, only those
+    videos are averaged (used to restrict to the common set across configs)."""
     acc = {k: [] for k in STAB_KEYS}
     times, frames = [], []
     per_video = {}
     for name, v in results.get("videos", {}).items():
         if v.get("status") != "completed":
+            continue
+        if allowed_videos is not None and name not in allowed_videos:
             continue
         times.append(v.get("time_seconds", np.nan))
         frames.append(v.get("n_frames", 0))
@@ -45,6 +49,11 @@ def aggregate(results):
     agg["mean_time_seconds"] = float(np.nanmean(times)) if times else None
     agg["n_videos"] = len(per_video)
     return agg, per_video
+
+
+def completed_videos(results):
+    return {n for n, v in results.get("videos", {}).items()
+            if v.get("status") == "completed"}
 
 
 def fmt(v, p=4):
@@ -65,11 +74,23 @@ def main():
     args = ap.parse_args()
     root = Path(args.dir)
 
-    configs = {}
+    raw = {}
     for rj in sorted(root.glob("*/results.json")):
         cname = rj.parent.name
-        results = json.loads(rj.read_text())
-        agg, per_video = aggregate(results)
+        raw[cname] = json.loads(rj.read_text())
+
+    # Restrict to the intersection of videos completed by every config, so all
+    # configs are averaged over exactly the same set (fair comparison).
+    common = None
+    for results in raw.values():
+        cv = completed_videos(results)
+        common = cv if common is None else (common & cv)
+    common = common or set()
+    print(f"Common videos across all configs ({len(common)}): {sorted(common)}")
+
+    configs = {}
+    for cname, results in raw.items():
+        agg, per_video = aggregate(results, allowed_videos=common)
         configs[cname] = {"agg": agg, "per_video": per_video,
                           "gen": results.get("generator")}
 

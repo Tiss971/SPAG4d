@@ -145,6 +145,10 @@ def compute_temporal_median2(frames_array, masks_dict: list[dict], quantile: flo
     for idx in range(F):
         if idx in masks_dict:
             for _, mask in masks_dict[idx].items():
+                # Guard against malformed SAM masks (some videos yield a
+                # degenerate 1D array instead of an (H, W) mask -> broadcast error)
+                if getattr(mask, "shape", None) != (H, W):
+                    continue
                 masks_array[idx] = np.maximum(masks_array[idx], mask)
 
     median_frame = np.zeros((H, W, C), dtype=frames_array.dtype)
