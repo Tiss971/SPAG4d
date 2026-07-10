@@ -341,6 +341,9 @@ def run_video(
     n_total_frames = len(viz_frames)
 
     # Flow
+    # Defined up-front so a WAFT failure falls back to SAM cleanly instead of
+    # raising UnboundLocalError on `if flow_masks is None` below.
+    flow_masks = None
     try:
         model = WAFTWrapper(
             checkpoint = '/raid/mb273924/_DATASETS/uptale/tar-c-t.pth',
