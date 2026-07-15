@@ -142,6 +142,32 @@ def denoise_mask(arr, opacity_min: float = 0.05, sor_k: int = 16,
     return keep
 
 
+def subsample_ply(path: str, max_points: int, seed: int = 0) -> dict:
+    """Uniform random subsample of a PLY's vertex element, in place.
+
+    UniSHARP has no native density/stride knob (unlike da360's SPAG `stride`),
+    so this is the post-hoc equivalent: pick `max_points` vertices uniformly
+    at random (all fields carried through unchanged) so gaussian counts can
+    be matched to a da360 run for a fair visual/temporal comparison. No-op if
+    the PLY already has <= max_points vertices.
+    """
+    from plyfile import PlyData, PlyElement
+    import numpy as np
+
+    ply = PlyData.read(path)
+    vtx = next(el for el in ply.elements if el.name == "vertex")
+    n = int(vtx.count)
+    if n <= max_points:
+        return {"num_gaussians": n, "subsampled": False}
+
+    rng = np.random.default_rng(seed)
+    idx = np.sort(rng.choice(n, size=max_points, replace=False))
+    arr = vtx.data[idx]
+    el = PlyElement.describe(arr, "vertex")
+    PlyData([el], text=ply.text).write(path)
+    return {"num_gaussians": int(max_points), "subsampled": True}
+
+
 def convert_unisharp_ply_to_spag(
     src_path: str,
     dst_path: str,

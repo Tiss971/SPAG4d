@@ -15,6 +15,13 @@ from tqdm import tqdm
 
 from .core import SPAG4D, ConversionResult
 from .detect_opticalflow import WAFTWrapper, abs_to_rel_coords, reencode_h264
+from .flow_depth_propagation import (
+    PropagationState,
+    compute_bidirectional_flow,
+    composite_bg_locked,
+    propagate_depth_via_flow,
+    upscale_flow,
+)
 from .ply_writer import save_ply_gsplat
 from .scene_analysis import compute_scene_defaults
 
@@ -308,6 +315,18 @@ def run_video(
     sparse_pruning: float = 0.1,  # 0.3,
     depth_preview_path: Path | None = None,
     temporal_consistency: bool = True,
+    depth_correction: str = "bglock",  # "affine" (legacy per-frame align) | "bglock" (background-locked to depth_ref + flow-propagated dynamic-mask objects; see .claude/depth_stability_benchmark.md)
+    bg_lock_dilate_px: int = 12,
+    bg_lock_feather_px: int = 9,
+    flow_seam_pad: int = 64,
+    fb_err_threshold: float = 1.5,
+    pole_margin_frac: float = 0.08,
+    unisharp_repo: str | None = "/raid/mb273924/SPAG4d/third_party/UniSHARP",
+    unisharp_python: str | None = None,
+    unisharp_checkpoint: str | None = "/raid/mb273924/SPAG4d/third_party/UniSHARP/pretained_model.pt",
+    unisharp_scale_align: str = "global",
+    unisharp_format_mode: str = "convert",
+    unisharp_max_gaussians: int | None = None,
 ):
     """
 
@@ -316,7 +335,21 @@ def run_video(
         'first': use first frame (default)
         'last' : use last frame
         'median_temporal': use average color of each frame as background color
+        depth_correction : per-frame depth stabilization strategy for a FIXED
+            camera. 'bglock' locks static (non-mask) pixels to depth_ref (the
+            temporal-median-background depth, ~zero temporal variance) and
+            uses the SAM3/activity dynamic mask (fused_mask) only to blend in
+            flow-propagated object depth — validated to cut background
+            temporal std ~1000x vs 'affine' with lower foreground flicker too.
+            'affine' keeps the legacy per-frame affine-alignment behavior.
     """
+    if depth_correction not in ("affine", "bglock"):
+        raise ValueError(f"depth_correction must be 'affine' or 'bglock', got {depth_correction!r}")
+    if depth_correction == "bglock" and alignement_mask not in ("sam", "sam_and_activity"):
+        raise ValueError(
+            "depth_correction='bglock' requires a real dynamic mask: "
+            "alignement_mask must be 'sam' or 'sam_and_activity'"
+        )
     if alignement_mask == "sam_and_activity":
         get_background_method = "temporal_median"
 
@@ -327,7 +360,59 @@ def run_video(
     viz_frames, meta = extract_video_frames(str(video_path), skip_step=skip_step)
     n_total_frames = len(viz_frames)
 
+    if active_generator == "unisharp360":
+        # UniSHARP is a whole-frame external subprocess pipeline (no raw depth
+        # map exposed in-process), so none of the SAM3/WAFT/depth-compositing
+        # machinery below (incl. depth_correction/bglock) applies here — it
+        # runs one full 3DGS reconstruction per frame instead of a depth map
+        # to composite. Kept as a separate early branch rather than forcing it
+        # through the per-frame depth loop it's architecturally incompatible with.
+        import tempfile
+
+        from .unisharp360 import convert_unisharp360
+
+        gaussians_dir = output_folder / "gaussians"
+        gaussians_dir.mkdir(parents=True, exist_ok=True)
+        n_gaussians = 0
+        with tempfile.TemporaryDirectory(prefix="spag4d_unisharp_frames_") as tmp_dir:
+            for idx, frame in enumerate(tqdm(viz_frames, desc="[UniSHARP]")):
+                frame_path = str(Path(tmp_dir) / f"frame_{idx}.jpg")
+                cv2.imwrite(frame_path, frame)  # frame is already BGR (cv2 convention)
+                result = convert_unisharp360(
+                    input_path=frame_path,
+                    output_path=str(gaussians_dir / f"frame_{idx}.ply"),
+                    device=torch.device("cuda"),
+                    unisharp_repo=unisharp_repo,
+                    unisharp_python=unisharp_python,
+                    checkpoint_path=unisharp_checkpoint,
+                    scale_align=unisharp_scale_align,
+                    format_mode=unisharp_format_mode,
+                )
+                n_gaussians = result["num_gaussians"]
+                if unisharp_max_gaussians:
+                    from .unisharp_format import subsample_ply
+
+                    sub = subsample_ply(
+                        str(gaussians_dir / f"frame_{idx}.ply"),
+                        unisharp_max_gaussians,
+                        seed=idx,
+                    )
+                    n_gaussians = sub["num_gaussians"]
+
+        processing_time = time.time() - start_time
+        file_size = (gaussians_dir / f"frame_{n_total_frames - 1}.ply").stat().st_size
+        return ConversionResult(
+            output_path=str(gaussians_dir / f"frame_{n_total_frames - 1}.ply"),
+            splat_count=n_gaussians,
+            file_size=file_size,
+            processing_time=processing_time,
+            depth_range=(0.0, 0.0),
+            depth_npy_path=None,
+            panorama_size=(meta["W"], meta["H"]),
+        )
+
     # Flow
+    flows_fwd, flows_bwd = [], []
     try:
         model = WAFTWrapper(
             checkpoint = '/raid/mb273924/_DATASETS/uptale/tar-c-t.pth',
@@ -357,6 +442,22 @@ def run_video(
         except Exception:
             pass
         flow_masks = stats["masks"]
+
+        if depth_correction == "bglock":
+            # Bidirectional flow (seam-padded, forward-backward consistency)
+            # for propagate_depth_via_flow. model.run() above only kept flow
+            # *magnitude masks* for SAM prompting, so this is a second WAFT
+            # pass over the same (already-downscaled) waft_frames.
+            print("[SPAG4D] Computing bidirectional WAFT flow for background-locked depth compositing...")
+            t0 = time.time()
+            for i in range(n_total_frames - 1):
+                ff, fb = compute_bidirectional_flow(model, waft_frames[i], waft_frames[i + 1], seam_pad=flow_seam_pad)
+                if scale < 1.0:
+                    ff = upscale_flow(ff, meta["H"], meta["W"])
+                    fb = upscale_flow(fb, meta["H"], meta["W"])
+                flows_fwd.append(ff)
+                flows_bwd.append(fb)
+            print(f"  {n_total_frames - 1} pairs in {time.time() - t0:.1f}s")
     except Exception as e:
         print(f"  [ERROR during inference] {e}")
         import traceback
@@ -562,6 +663,9 @@ def run_video(
 
     fg_stabilizer = FGDepthStabilizer2(buffer_size=21, jump_threshold=0.5)
 
+    depth_prev_final = None  # bg-locked mode: previous frame's composited depth, warped forward each step
+    flow_state = PropagationState(decay=0.85)
+
     (output_folder / "gaussians").mkdir(parents=True, exist_ok=True)
     for idx, frame in enumerate(tqdm(viz_frames)):
         # Depth estimation
@@ -608,7 +712,32 @@ def run_video(
             ).copy()
         aligned_median_depth_fg.append(float(np.median(aligned_depth_np[fused_mask > 0])))
 
-        aligned_depth_np2 = fg_stabilizer(aligned_depth_np, fused_mask).copy()
+        if depth_correction == "bglock" and alignement_mask != "nothing":
+            # Real SAM3(+activity) dynamic mask -> flow-propagate the object
+            # depth for temporal coherence, then lock every static pixel to
+            # depth_ref_np (fixed camera => zero-variance background) and
+            # blend in the object depth only inside the feathered mask.
+            if idx == 0 or depth_prev_final is None:
+                depth_object = aligned_depth_np.copy()
+            else:
+                depth_object, _, _ = propagate_depth_via_flow(
+                    depth_prev_final,
+                    aligned_depth_np,
+                    depth_ref_np,
+                    flows_fwd[idx - 1],
+                    flows_bwd[idx - 1],
+                    flow_state,
+                    fb_err_threshold=fb_err_threshold,
+                    pole_margin_frac=pole_margin_frac,
+                    disocclusion_mask=fused_mask,
+                )
+            aligned_depth_np2, _ = composite_bg_locked(
+                depth_object, depth_ref_np, fused_mask,
+                dilate_px=bg_lock_dilate_px, feather_px=bg_lock_feather_px,
+            )
+            depth_prev_final = aligned_depth_np2
+        else:
+            aligned_depth_np2 = fg_stabilizer(aligned_depth_np, fused_mask).copy()
         stabilized_aligned_median_depth_fg.append(
             float(np.median(aligned_depth_np2[fused_mask > 0]))
         )

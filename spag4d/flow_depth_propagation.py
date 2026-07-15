@@ -73,6 +73,21 @@ def crop_horizontal(arr: np.ndarray, pad: int, width: int) -> np.ndarray:
     return arr[:, pad : pad + width]
 
 
+def upscale_flow(flow: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Resize a (h,w,2) pixel-displacement flow field to (out_h,out_w,2),
+    scaling the displacement magnitudes to the new pixel grid. Used when flow
+    is computed at a reduced resolution (WAFT correlation cost) but depth/
+    compositing runs at native resolution."""
+    h, w = flow.shape[:2]
+    if (h, w) == (out_h, out_w):
+        return flow
+    sx, sy = out_w / w, out_h / h
+    resized = cv2.resize(flow, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    resized[..., 0] *= sx
+    resized[..., 1] *= sy
+    return resized
+
+
 def compute_bidirectional_flow(
     waft, frame_a: np.ndarray, frame_b: np.ndarray, seam_pad: int = 64
 ) -> tuple[np.ndarray, np.ndarray]:

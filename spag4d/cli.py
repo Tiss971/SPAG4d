@@ -3,8 +3,9 @@
 Command-line interface for SPAG-4D.
 """
 
-import click
 from pathlib import Path
+
+import click
 
 
 @click.group()
@@ -51,23 +52,36 @@ def main():
               help='Upscale faces with SeedVR2 before SHARP prediction')
 @click.option('--sharp-backend', type=click.Choice(['sharp', 'unisharp', 'hybrid']),
               default='sharp', help='sharp360 backend (default: sharp)')
-@click.option('--unisharp-repo', type=click.Path(), default=None,
+@click.option('--unisharp-repo', type=click.Path(), default='/raid/mb273924/SPAG4d/third_party/UniSHARP',
               help='Path to a local clone of Insta360-Research-Team/UniSHARP')
 @click.option('--unisharp-python', type=click.Path(), default=None,
               help='python executable of the unisharp conda env')
-@click.option('--unisharp-checkpoint', type=click.Path(), default=None,
+@click.option('--unisharp-checkpoint', type=click.Path(), default='/raid/mb273924/SPAG4d/third_party/UniSHARP/pretained_model.pt',
               help='UniSHARP checkpoint (step_XXXXXXX.pt)')
 @click.option('--unisharp-scale-align', type=click.Choice(['none', 'global', 'da360_grid']),
               default='global', help='UniSHARP scale alignment mode (default: global)')
 @click.option('--unisharp-format-mode', type=click.Choice(['copy', 'convert']),
-              default='copy', help='UniSHARP PLY format handling (default: copy)')
+              default='convert', help='UniSHARP PLY format handling (default: copy)')
 @click.option('--unisharp-save-debug', is_flag=True,
               help='Keep UniSHARP raw PLY, gifs, and metadata')
 @click.option('--unisharp-raw-output-dir', type=click.Path(), default=None,
               help='Persist the UniSHARP working dir here (default: temp dir)')
+@click.option('--alignement-mask', type=click.Choice(['sam', 'sam_and_activity', 'nothing', 'all']),
+              default="sam_and_activity", help='')
+@click.option('--alignement-method', type=click.Choice(['lstsq', 'median', 'ransac']),
+              default="lstsq", help='')
+@click.option('--depth-correction', type=click.Choice(['bglock', 'affine']),
+              default="bglock",
+              help='Per-frame depth stabilization for a fixed camera. bglock (default) locks '
+                   'static pixels to the reference depth and flow-propagates the SAM3-masked '
+                   'dynamic region; affine keeps the legacy per-frame affine alignment.')
+@click.option('--quantile', default=0.33, help='Quantile threshold of movement needed for pixel activity (0=small movement needed, 1=huge movement needed)')
+@click.option('--freeze-bg', is_flag=True, help='Use same background for all frame')
+@click.option('--skip-step', default=1, type=int, help='')
+@click.option('--depth-preview', is_flag=True, help='Save depth estimation frame-by-frame')
 def convert(
-    input_path: str,
-    output_path: str,
+    input_path: str | Path,
+    output_path: str | Path,
     depth_model: str,
     sharp_refine: bool,
     stride: int,
@@ -97,6 +111,13 @@ def convert(
     unisharp_format_mode: str,
     unisharp_save_debug: bool,
     unisharp_raw_output_dir: str,
+    alignement_mask: str,
+    alignement_method: str,
+    depth_correction: str,
+    quantile: float,
+    freeze_bg: bool,
+    skip_step: int,
+    depth_preview: bool,
 ):
     """
     Convert equirectangular panorama to Gaussian splat PLY.
@@ -108,6 +129,7 @@ def convert(
     higher quality per-face SHARP refinement.
     """
     from .core import SPAG4D
+    from .video import run_video
 
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -130,11 +152,17 @@ def convert(
         device=device,
         depth_model=depth_model,
         use_mock_dap=mock_dap,
-        sharp_refine=sharp_refine,
-        sharp_cubemap_size=sharp_cubemap_size,
-        sharp_projection_mode=sharp_projection,
+        # sharp_refine=sharp_refine,
+        # sharp_cubemap_size=sharp_cubemap_size,
+        # sharp_projection_mode=sharp_projection,
         generator=generator,
     )
+
+    if depth_preview:
+        depth_preview_path = output_path.parent / 'depths'
+        depth_preview_path.mkdir(parents=True, exist_ok=True)
+    else:
+        depth_preview_path = None
 
     def run_single(img_path, out_path):
         return converter.convert(
@@ -147,6 +175,7 @@ def convert(
             outlier_pruning=outlier_pruning,
             global_scale=global_scale,
             force_erp=force_erp,
+            depth_preview_path= str(depth_preview_path / 'depth.jpeg'),
             generator=generator or depth_model,
             side_count=side_count,
             seedvr2_upscale=seedvr2_upscale,
@@ -163,8 +192,8 @@ def convert(
             unisharp_raw_output_dir=unisharp_raw_output_dir,
         )
 
-    if batch:
-        if not input_path.is_dir():
+    if input_path.is_dir():
+        if not output_path.is_dir():
             raise click.ClickException("Input path must be a directory for batch mode")
 
         output_path.mkdir(parents=True, exist_ok=True)
@@ -183,6 +212,32 @@ def convert(
                     click.echo(f"  {img_path.name} -> {result.splat_count:,} splats")
             except Exception as e:
                 click.echo(f"  {img_path.name}: {e}", err=True)
+    elif input_path.suffix.lower() in {'.mp4', '.avi', '.mov'}:
+        result = run_video(
+            converter,
+            input_path,
+            output_path,
+            generator,
+            get_background_method = "temporal_median",
+            alignement_mask = alignement_mask,
+            alignement_method = alignement_method,
+            depth_correction = depth_correction,
+            quantile = quantile,
+            freeze_bg = freeze_bg,
+            skip_step = skip_step,
+            depth_min = depth_min,
+            depth_max = depth_max,
+            sky_threshold = sky_threshold,
+            stride=stride,
+            outlier_pruning=outlier_pruning,
+            grazing_angle = 85.0, #65.0,
+            sparse_pruning = 0.1, #0.3,
+            global_scale=global_scale,
+            depth_preview_path=depth_preview_path,
+        )
+        if not quiet:
+            click.echo(f"Converted: {result.splat_count:,} Gaussians")
+            click.echo(f"Time: {result.processing_time:.2f}s")
     else:
         result = run_single(input_path, output_path)
 
@@ -239,7 +294,8 @@ def download_models(model: str, verify: bool):
     if model in ('pager', 'all'):
         try:
             from huggingface_hub import snapshot_download
-            from spag4d.pager_model import PAGER_REPO, PAGER_CACHE_DIR
+
+            from spag4d.pager_model import PAGER_CACHE_DIR, PAGER_REPO
             click.echo("Downloading PaGeR weights (prs-eth/PaGeR, ~5.7GB, CC BY-NC 4.0 non-commercial)...")
             path = snapshot_download(PAGER_REPO, cache_dir=str(PAGER_CACHE_DIR))
             click.echo(f"PaGeR weights cached at: {path}")
@@ -263,8 +319,9 @@ def serve(port: int, host: str, reload: bool):
             "uvicorn not installed. Install with: pip install uvicorn"
         )
 
-    import logging
     import copy
+    import logging
+
     from uvicorn.config import LOGGING_CONFIG
 
     class EndpointFilter(logging.Filter):
