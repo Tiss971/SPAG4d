@@ -45,7 +45,16 @@
       "Bash(git check-ignore:*)",
       "Bash(git:*)",
       "Bash(\"./.venv/Scripts/python.exe\":*)",
-      "WebFetch(domain:deepwiki.com)"
+      "WebFetch(domain:deepwiki.com)",
+      "Bash(pip list *)",
+      "Bash(conda run *)",
+      "Bash(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv)",
+      "Read(//raid/mb273924/_DATASETS/uptale/**)",
+      "Read(//raid/mb273924/SPAG4d/**)",
+      "Read(//home/mb273924/.cache/spag4d/**)",
+      "Bash(find / -iname \"*pager*\" -maxdepth 4)",
+      "Bash(conda env *)",
+      "Bash(cd *)"
     ]
   }
 }
