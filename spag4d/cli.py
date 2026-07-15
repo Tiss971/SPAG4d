@@ -70,6 +70,11 @@ def main():
               default="sam_and_activity", help='')
 @click.option('--alignement-method', type=click.Choice(['lstsq', 'median', 'ransac']),
               default="lstsq", help='')
+@click.option('--depth-correction', type=click.Choice(['bglock', 'affine']),
+              default="bglock",
+              help='Per-frame depth stabilization for a fixed camera. bglock (default) locks '
+                   'static pixels to the reference depth and flow-propagates the SAM3-masked '
+                   'dynamic region; affine keeps the legacy per-frame affine alignment.')
 @click.option('--quantile', default=0.33, help='Quantile threshold of movement needed for pixel activity (0=small movement needed, 1=huge movement needed)')
 @click.option('--freeze-bg', is_flag=True, help='Use same background for all frame')
 @click.option('--skip-step', default=1, type=int, help='')
@@ -108,6 +113,7 @@ def convert(
     unisharp_raw_output_dir: str,
     alignement_mask: str,
     alignement_method: str,
+    depth_correction: str,
     quantile: float,
     freeze_bg: bool,
     skip_step: int,
@@ -215,6 +221,7 @@ def convert(
             get_background_method = "temporal_median",
             alignement_mask = alignement_mask,
             alignement_method = alignement_method,
+            depth_correction = depth_correction,
             quantile = quantile,
             freeze_bg = freeze_bg,
             skip_step = skip_step,

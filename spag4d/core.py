@@ -18,7 +18,7 @@ from PIL import Image, ImageOps
 class ConversionResult:
     """Result of SPAG-4D conversion."""
     output_path: str
-    splat_count: int
+    splat_count: int | list[int]
     file_size: int
     processing_time: float
     depth_range: tuple
