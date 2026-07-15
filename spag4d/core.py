@@ -5,13 +5,12 @@ Main SPAG4D class that orchestrates the conversion pipeline.
 DAP/DA360 depth estimation -> SPAG spherical Gaussian conversion -> PLY export
 """
 
-import torch
-import numpy as np
-from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, Union
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
+import torch
 from PIL import Image, ImageOps
 
 
@@ -19,12 +18,12 @@ from PIL import Image, ImageOps
 class ConversionResult:
     """Result of SPAG-4D conversion."""
     output_path: str
-    splat_count: int
+    splat_count: int | list[int]
     file_size: int
     processing_time: float
     depth_range: tuple
-    depth_npy_path: Optional[str] = None
-    panorama_size: Optional[tuple] = None
+    depth_npy_path: str | None = None
+    panorama_size: tuple | None = None
 
 
 class SPAG4D:
@@ -34,9 +33,9 @@ class SPAG4D:
         self,
         device: str = "cuda",
         depth_model: str = "da360",
-        model_path: Optional[str] = None,
+        model_path: str | None = None,
         use_mock_dap: bool = False,
-        generator: Optional[str] = None,
+        generator: str | None = None,
     ):
         self.device = torch.device(
             device if device != "cuda" or torch.cuda.is_available() else "cpu"
@@ -81,22 +80,22 @@ class SPAG4D:
 
     def convert(
         self,
-        input_path: Union[str, Path],
-        output_path: Union[str, Path],
-        depth_min: Optional[float] = None,
-        depth_max: Optional[float] = None,
-        sky_threshold: Optional[float] = None,
+        input_path: str | Path,
+        output_path: str | Path,
+        depth_min: float | None = None,
+        depth_max: float | None = None,
+        sky_threshold: float | None = None,
         stride: int = 2,
         outlier_pruning: float = 0.3,
         grazing_angle: float = 65.0,
         sparse_pruning: float = 0.3,
         global_scale: float = 1.0,
         force_erp: bool = False,
-        depth_model: Optional[str] = None,
+        depth_model: str | None = None,
         grid_jitter: float = 0.0,
-        depth_preview_path: Optional[Union[str, Path]] = None,
-        depth_npy_path: Optional[Union[str, Path]] = None,
-        generator: Optional[str] = None,
+        depth_preview_path: str | Path | None = None,
+        depth_npy_path: str | Path | None = None,
+        generator: str | None = None,
         side_count: int = 6,
         seedvr2_upscale: bool = False,
         sharp_include_caps: bool = True,
@@ -107,13 +106,13 @@ class SPAG4D:
         pager_use_normals: bool = False,
         # --- new: sharp360 backend selection ---
         sharp_backend: str = "sharp",
-        unisharp_repo: Optional[str] = None,
-        unisharp_python: Optional[str] = None,
-        unisharp_checkpoint: Optional[str] = None,
+        unisharp_repo: str | None = 'third_party/UniSHARP',
+        unisharp_python: str | None = None,
+        unisharp_checkpoint: str | None = None,
         unisharp_scale_align: str = "global",
-        unisharp_format_mode: str = "copy",
+        unisharp_format_mode: str = "convert",
         unisharp_save_debug: bool = False,
-        unisharp_raw_output_dir: Optional[str] = None,
+        unisharp_raw_output_dir: str | None = None,
     ) -> ConversionResult:
         """
         Convert equirectangular panorama to Gaussian splat PLY.
@@ -165,8 +164,8 @@ class SPAG4D:
         # Dispatch to sharp360 / unisharp360 generators if requested
         active_generator = generator or self.generator
         if active_generator in ("sharp360", "unisharp360"):
-            from .sharp360 import convert_sharp360
             from .seedvr2 import SeedVR2Config
+            from .sharp360 import convert_sharp360
             seedvr2_cfg = SeedVR2Config() if seedvr2_upscale else None
 
             effective_backend = sharp_backend
@@ -330,7 +329,7 @@ class SPAG4D:
         stride: int,
     ) -> dict:
         """SPAG path: direct depth-to-Gaussian conversion."""
-        from .spag_converter import depth_to_gaussians, SPAGParams
+        from .spag_converter import SPAGParams, depth_to_gaussians
 
         print(f"[SPAG4D] SPAG conversion (stride={stride})...", flush=True)
         t = time.time()
@@ -355,7 +354,7 @@ class SPAG4D:
         return gaussians
 
     @staticmethod
-    def _save_depth_preview(depth: torch.Tensor, path: Union[str, Path]):
+    def _save_depth_preview(depth: torch.Tensor, path: str | Path):
         """Save depth map visualization as JPEG."""
         try:
             import cv2
