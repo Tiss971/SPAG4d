@@ -424,7 +424,7 @@ def prune_grazing_angle(
     r = np.linalg.norm(means, axis=1)
     y = means[:, 1]
     phi = np.arccos(np.clip(y / np.maximum(r, 1e-8), -1, 1))  # [0, pi]
-    theta = np.arctan2(-means[:, 2], means[:, 0])  # [-pi, pi]
+    theta = np.arctan2(means[:, 2], means[:, 0])  # [-pi, pi]
     theta = theta % (2 * np.pi)  # [0, 2pi]
 
     # Map to pixel coordinates
