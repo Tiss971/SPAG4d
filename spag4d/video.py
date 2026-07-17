@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 
@@ -14,17 +15,35 @@ from sam3.visualization_utils import (
 from tqdm import tqdm
 
 from .core import SPAG4D, ConversionResult
-from .detect_opticalflow import WAFTWrapper, abs_to_rel_coords, reencode_h264
+from .detect_opticalflow import WAFTWrapper, abs_to_rel_coords
 from .flow_depth_propagation import (
     PropagationState,
-    compute_bidirectional_flow,
     composite_bg_locked,
+    compute_bidirectional_flow,
     propagate_depth_via_flow,
     upscale_flow,
 )
 from .ply_writer import save_ply_gsplat
 from .scene_analysis import compute_scene_defaults
 
+
+def reencode_h264(src: str) -> str:
+    import subprocess
+
+    dst = src.replace(".mp4", "_h264.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-vcodec", "libx264", "-pix_fmt", "yuv420p", dst],
+            check=True,
+            capture_output=True,
+        )
+    except Exception as e:
+        print(e)
+        pass
+    else:
+        # delete path
+        os.remove(src)
+    return dst
 
 def print_gpu_stats(label: str = "", file=None):
     if torch.cuda.is_available():
@@ -44,7 +63,7 @@ def print_gpu_stats(label: str = "", file=None):
         print("=" * 50, file=file)
 
 
-def extract_video_frames(video_path: str, skip_step: int = 10) -> tuple[np.ndarray, int]:
+def extract_video_frames(video_path: str, output_folder:str, skip_step: int = 10, export: bool = False) -> tuple[np.ndarray, int]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise OSError(f"Cannot open: {video_path}")
@@ -63,9 +82,11 @@ def extract_video_frames(video_path: str, skip_step: int = 10) -> tuple[np.ndarr
         "total":  total_frames,
     }
 
-    # video_writer = cv2.VideoWriter(  # USED TO CREATE SHORTER VIDEOS FOR DEBUG/TEST
-    #     "temp_fast_track.mp4", cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (W, H)
-    # )
+    if export:
+        frames_folder = output_folder / "images"
+        frames_folder.mkdir(parents=True, exist_ok=True)
+        # USED TO CREATE SHORTER VIDEOS FOR DEBUG/TEST
+        # video_writer = cv2.VideoWriter("temp_fast_track.mp4", cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (W, H))
 
     idx = 0
     try:
@@ -77,7 +98,9 @@ def extract_video_frames(video_path: str, skip_step: int = 10) -> tuple[np.ndarr
                 if not ok:
                     break
 
-                # video_writer.write(frame_bgr)
+                if export:
+                    cv2.imwrite(str(frames_folder / f"frame_{idx:04d}.png"), frame_bgr)
+                    # video_writer.write(frame_bgr)
                 frames[idx] = frame_bgr
 
 
@@ -100,43 +123,25 @@ def extract_video_frames(video_path: str, skip_step: int = 10) -> tuple[np.ndarr
     return frames[:idx], meta  # slice in case video ended early
 
 
-def compute_temporal_median(frames_array, quantile: float = 0.33):
-    print("Calcul de la médiane temporelle (cela peut prendre quelques secondes)...")
-    start = time.time()
+def _activity_mask_from_std(std_frame: np.ndarray, abs_threshold: float, fallback_frac: float = 0.01) -> np.ndarray:
+    """Absolute std threshold for "real" frame-to-frame activity.
 
-    # Stack once — if viz_frames is already an ndarray, this is a no-op
-    if not isinstance(frames_array, np.ndarray):
-        frames_array = np.stack(frames_array, axis=0)  # avoids extra copy vs np.array()
-
-    # Calcul de la médiane sur l'axe 0 (l'axe du temps)
-    start = time.time()
-    F, H, W, C = frames_array.shape
-    median_frame = np.empty((H, W, C), dtype=frames_array.dtype)
-    std_frame = torch.zeros((H, W), dtype=torch.float32)
-    for c in range(C):  # Channel by channel to reduce VRAM usage
-        channel = torch.from_numpy(frames_array[:, :, :, c])  # (F, H, W)
-        median_frame[:, :, c] = torch.median(channel.to("cuda"), dim=0).values.cpu().numpy()
-        std_frame += torch.std(channel, dim=0).cpu()  # accumulate std per channel
-    med = time.time()
-    print(f"Median computed in {(med - start):.1f}s")
-
-    # On peut aussi enregistrer les pixels qui varient le plus pour visualiser les zones les plus dynamiques
-    std_frame /= C
-    std_max = std_frame.max().item()
-    if std_max > 0:
-        activity_map = (std_frame * (255.0 / std_max)).byte().numpy()
-    else:
-        activity_map = np.zeros((H, W), dtype=np.uint8)
-    thr = torch.quantile(std_frame, quantile).item()
-    activity_mask = ((std_frame > thr).byte() * 255).numpy()
-    print(f"min: {std_frame.min()}, {quantile} quantile: {thr:.4f}")
-    cv2.imwrite("temporal_activity_map.jpg", activity_map)
-    print(f"Temporal_activity_map computed in {(time.time() - med):.1f}s")
-
-    return median_frame, activity_mask
+    A quantile/rank-based cut always flags exactly `quantile` of the pixels
+    as "active" no matter the content (empirically confirmed: same fraction
+    on a near-static warehouse clip and a clip with real moving subjects —
+    see .claude/TEMPORAL_STABILITY_SUMMARY.md). An absolute threshold lets a
+    genuinely static scene end up with ~0% active. Falls back to the top
+    `fallback_frac` of pixels (by std) if the absolute threshold clears
+    fewer than that, so the mask is never completely empty.
+    """
+    mask = std_frame > abs_threshold
+    if mask.mean() < fallback_frac:
+        thr = np.quantile(std_frame, 1.0 - fallback_frac)
+        mask = std_frame > thr
+    return mask
 
 
-def compute_temporal_median2(frames_array, masks_dict: list[dict], quantile: float = 0.33):
+def compute_temporal_median(frames_array, masks_dict: list[dict], activity_std_threshold: float = 10.0):
     print("Calcul de la médiane temporelle (cela peut prendre quelques secondes)...")
     start = time.time()
     # Stack once — if viz_frames is already an ndarray, this is a no-op
@@ -171,17 +176,16 @@ def compute_temporal_median2(frames_array, masks_dict: list[dict], quantile: flo
         # 3. For the STD: Compute normally
         std_frame += torch.std(channel_tensor, dim=0).cpu().numpy()
 
-    # 4. Handle any pixels that were masked out across ALL frames (avoiding NaN artifacts)
-    # If a pixel was ALWAYS masked, nanmedian will return NaN. We replace them with 0.
-    np.nan_to_num(median_frame, copy=False, nan=0.0)
+    always_masked = masks_array.all(axis=0)  # (H, W): masked in every single frame
+    median_frame = np.nan_to_num(median_frame, nan=0.0)
 
     # On peut aussi enregistrer les pixels qui varient le plus pour visualiser les zones les plus dynamiques
     std_frame /= C
-    thr = np.quantile(std_frame, quantile).item()
-    activity_mask = ((std_frame > thr) * 255).astype(np.uint8)
+    activity_mask = (_activity_mask_from_std(std_frame, activity_std_threshold) * 255).astype(np.uint8)
+    print(f"abs threshold: {activity_std_threshold} -> active frac {(activity_mask > 0).mean():.4f}")
 
     print(f"Median computed in {(time.time() - start):.1f}s")
-    return median_frame, activity_mask
+    return median_frame, activity_mask, always_masked
 
 
 def to_gaussians(
@@ -308,7 +312,8 @@ def run_video(
     get_background_method: str = "temporal_median",
     alignement_mask: str = "sam_and_activity",  # sam, sam_and_activity, nothing, all
     alignement_method: str = "lstsq",  # lstsq, median, ransac
-    quantile: float = 0.33,
+    quantile: float = 0.1,  # unused by the activity mask (see activity_std_threshold); kept for the output filename/stats key
+    activity_std_threshold: float = 10.0,
     skip_step: int = 10,
     freeze_bg: bool = False,
     depth_min: float | None = None,
@@ -320,6 +325,7 @@ def run_video(
     global_scale: float = 1.0,
     sparse_pruning: float = 0.1,  # 0.3,
     depth_preview_path: Path | None = None,
+    depth_npy_dir: Path | str | None = None,
     temporal_consistency: bool = False,
     # --- Solution 1: temporal depth smoothing ---
     depth_smoothing: bool = False,
@@ -360,6 +366,17 @@ def run_video(
             flow-propagated object depth — validated to cut background
             temporal std ~1000x vs 'affine' with lower foreground flicker too.
             'affine' keeps the legacy per-frame affine-alignment behavior.
+        depth_npy_dir : optional directory to dump the raw per-frame metric
+            depth map (the exact array passed to to_gaussians, i.e. after
+            alignment/bglock compositing/freeze_bg masking) as float32 .npy,
+            one file per frame ("depth_{idx}.npy"). Unlike depth_preview_path
+            (which only writes a log1p + percentile-normalized colormap JPEG
+            for visualization -- see SPAG4D._save_depth_preview -- and cannot
+            be inverted back to metric depth), this preserves real depth
+            values so the map can be used directly as an alternative Gaussian
+            init source (e.g. isotropic per-pixel splats sized from depth,
+            instead of the anisotropic SPAG-fitted scale/rotation which tends
+            to produce view-aligned "needle" Gaussians for a fixed camera).
     """
     if depth_correction not in ("affine", "bglock"):
         raise ValueError(f"depth_correction must be 'affine' or 'bglock', got {depth_correction!r}")
@@ -375,7 +392,7 @@ def run_video(
     output_folder.mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
-    viz_frames, meta = extract_video_frames(str(video_path), skip_step=skip_step)
+    viz_frames, meta = extract_video_frames(str(video_path), output_folder, skip_step=skip_step, export=True)
     n_total_frames = len(viz_frames)
 
     # Flow
@@ -471,6 +488,7 @@ def run_video(
             # for propagate_depth_via_flow. model.run() above only kept flow
             # *magnitude masks* for SAM prompting, so this is a second WAFT
             # pass over the same (already-downscaled) waft_frames.
+            # TODO: FACTORISE TO HAVE ONE PASS ONLY
             print("[SPAG4D] Computing bidirectional WAFT flow for background-locked depth compositing...")
             t0 = time.time()
             for i in range(n_total_frames - 1):
@@ -513,9 +531,12 @@ def run_video(
             print(f"[MaskDiag] failed: {e}")
 
     # On récup un background fixe
+    always_masked_mask = None
     if get_background_method == "temporal_median":
-        master_background, activity_mask = compute_temporal_median2(viz_frames, outputs_per_frame, quantile)
-        cv2.imwrite(output_folder / f"_temporal_activity_mask_thr_{f'{quantile:.2f}'.split('.')[-1]}.jpg", activity_mask)
+        master_background, activity_mask, always_masked_mask = compute_temporal_median(
+            viz_frames, outputs_per_frame, activity_std_threshold
+        )
+        cv2.imwrite(output_folder / f"_temporal_activity_mask_abs{activity_std_threshold:g}.jpg", activity_mask)
     elif get_background_method == "last":
         master_background = viz_frames[-1]
     else:
@@ -533,14 +554,13 @@ def run_video(
         dm_name = active_generator
     else:
         dm_name = converter.default_depth_model
-        print("Only 'da360' and 'pager' are supported for video. Fallback to da360")
+        print(f"Can't use {active_generator}. Only 'da360' and 'pager' are supported for video. Fallback to da360")
     depth_engine = converter._get_depth_model(dm_name)
     print(f"[SPAG4D] Running {dm_name.upper()} depth estimation...", flush=True)
 
     start_depthref = time.time()
     reference_bg = torch.from_numpy(master_background).to("cuda")
     with torch.inference_mode():
-        # Use temporal_consistency mode (if requested) for consistent scaling across frames
         depth_raw, _ = depth_engine.predict(reference_bg, temporal_consistency=temporal_consistency)
 
         # Solution 4: multi-frame depth reference.
@@ -560,29 +580,36 @@ def run_video(
             print(f"[SPAG4D] Solution 4: reference depth = median of {n_ref} frames "
                   f"(indices {list(ref_indices)})")
 
-    # Calculate scale factor to normalize median depth to ~5m (single time, for all frames)
-    depth_median = float(depth_raw.median())
-    scale_factor_to_5m = 5.0 / depth_median if depth_median > 1e-6 else 1.0
+    depth_ref = depth_raw *  global_scale
+    if temporal_consistency:
+        # Calculate scale factor to normalize median depth to ~5m (single time, for all frames)
+        depth_median = float(depth_raw.median())
+        scale_factor_to_5m = 5.0 / depth_median if depth_median > 1e-6 else 1.0
+        depth_ref *= scale_factor_to_5m
 
-    depth_ref = depth_raw * scale_factor_to_5m * global_scale
     # Save depth preview if requested
     if depth_preview_path:
         converter._save_depth_preview(
             depth_ref, str(depth_preview_path / "_masterdepth.jpg")
         )
     depth_ref_np = depth_ref.cpu().numpy()
+    if always_masked_mask.any():
+        # Mark pixels never seen unmasked as NaN
+        # Forces filter_gaussian_candidates to drop them,
+        # creating an honest hole in the scene instead of a fabricated surface.
+        depth_ref_np[always_masked_mask] = np.nan
+        print(f"[SPAG4D] {int(always_masked_mask.sum())} px excluded from depth_ref (no Gaussians will be generated there)")
     print(f"[SPAG4D] Depth estimation for master bg completed in {1000 * (time.time() - start_depthref):.2f} ms")
 
-    # C1 FIX: Calculate scene defaults once from reference depth (not per-frame)
-    if depth_min is None or depth_max is None or sky_threshold is None:
-        from .scene_analysis import compute_scene_defaults
-        ref_defaults = compute_scene_defaults(depth_ref_np, image_height=reference_bg.shape[0])
-        if depth_min is None:
-            depth_min = ref_defaults["depth_min"]
-        if depth_max is None:
-            depth_max = ref_defaults["depth_max"]
-        if sky_threshold is None:
-            sky_threshold = ref_defaults["sky_threshold"]
+    # Calculate scene defaults once from reference depth (not per-frame)
+    from .scene_analysis import compute_scene_defaults
+    ref_defaults = compute_scene_defaults(depth_ref_np, image_height=reference_bg.shape[0])
+    if depth_min is None:
+        depth_min = ref_defaults["depth_min"]
+    if depth_max is None:
+        depth_max = ref_defaults["depth_max"]
+    if sky_threshold is None:
+        sky_threshold = ref_defaults["sky_threshold"]
 
     W, H, _ = reference_bg.shape
     gaussians_bg = to_gaussians(
@@ -598,6 +625,7 @@ def run_video(
         grazing_angle,
         sparse_pruning,
     )
+    n_bg_points = int(gaussians_bg["means"].shape[0])
 
     output_path = str(output_path)
     depth_estimation_cumtime = 0
@@ -614,79 +642,7 @@ def run_video(
     background_depth_deltas = []
     foreground_depth_deltas = []
 
-    class FGDepthStabilizer:
-        """
-        Stabilisation causale de la depth foreground.
-
-        Maintient une baseline EMA qui n'est mise à jour que sur les frames
-        jugées normales — évite l'effet de cliquet où chaque correction
-        pollue la référence pour la frame suivante.
-
-        Gère aussi le cas d'un vrai changement de profondeur soutenu :
-        si trop de frames consécutives sont "outliers", on considère que
-        c'est un changement réel et on resynchronise la baseline.
-        """
-
-        def __init__(
-            self,
-            jump_threshold: float = 0.5,
-            ema_alpha: float = 0.3,  # vitesse d'adaptation de la baseline
-            max_outlier_run: int = 4,  # au-delà, on accepte le changement comme réel
-            scale_clip: tuple = (0.5, 2.0),
-        ):
-            self.jump_threshold = jump_threshold
-            self.ema_alpha = ema_alpha
-            self.max_outlier_run = max_outlier_run
-            self.scale_clip = scale_clip
-
-            self.baseline: float | None = None
-            self.outlier_run: int = 0
-
-        def __call__(self, depth: np.ndarray, mask: np.ndarray) -> np.ndarray:
-            fg = mask > 0
-            if fg.sum() == 0:
-                return depth
-
-            current_median = float(np.median(depth[fg]))
-
-            # Première frame : initialise la baseline, rien à corriger
-            if self.baseline is None:
-                self.baseline = current_median
-                return depth
-
-            delta = abs(current_median - self.baseline)
-
-            if delta <= self.jump_threshold:
-                # Frame normale : update baseline (EMA) + reset compteur
-                self.baseline = (
-                    self.ema_alpha * current_median + (1 - self.ema_alpha) * self.baseline
-                )
-                self.outlier_run = 0
-                return depth
-
-            # --- Outlier détecté ---
-            self.outlier_run += 1
-
-            if self.outlier_run > self.max_outlier_run:
-                # Changement soutenu sur plusieurs frames → probablement réel.
-                # On accepte la nouvelle valeur comme baseline et on arrête de corriger.
-                self.baseline = current_median
-                self.outlier_run = 0
-                return depth
-
-            # Outlier ponctuel → correction vers la baseline (gelée, non polluée)
-            if current_median <= 0:
-                return depth
-
-            scale = np.clip(self.baseline / current_median, *self.scale_clip)
-            corrected = depth.copy()
-            corrected[fg] *= scale
-            return corrected
-
-    fg_stabilizer = FGDepthStabilizer(jump_threshold=0.5, max_outlier_run=4)
-
     from collections import deque
-
     class FGDepthStabilizer2:
         """
         Baseline = médiane glissante sur les N dernières valeurs FG brutes.
@@ -785,6 +741,13 @@ def run_video(
     flow_state = PropagationState(decay=0.85)
 
     (output_folder / "gaussians").mkdir(parents=True, exist_ok=True)
+    if freeze_bg:
+        import json
+        with open(output_folder / "gaussians" / "_freeze_bg_meta.json", "w") as f:
+            json.dump({"freeze_bg": True, "n_bg_points": n_bg_points}, f, indent=2)
+    if depth_npy_dir is not None:
+        depth_npy_dir = Path(depth_npy_dir)
+        depth_npy_dir.mkdir(parents=True, exist_ok=True)
     n_gaussians = []
     for idx, frame in enumerate(tqdm(viz_frames)):
         # Depth estimation
@@ -794,7 +757,9 @@ def run_video(
         with torch.inference_mode():
             # Use temporal_consistency mode (if requested) for consistency across frames
             depth_raw, _ = depth_engine.predict(image_tensor, temporal_consistency=temporal_consistency)
-        depth = depth_raw * scale_factor_to_5m * global_scale
+        depth = depth_raw * global_scale
+        if temporal_consistency:
+            depth *= scale_factor_to_5m
         depth_np = depth.cpu().numpy()
 
         # Save depth preview if requested
@@ -805,17 +770,16 @@ def run_video(
         depth_estimation_cumtime += time.time() - start_depth
 
         start_depth = time.time()
-        if alignement_mask in ["sam", "sam_and_activity", "nothing"]:
-            output = outputs_per_frame[idx * skip_step]
-        # fuse all mask into one single mask (we can also keep them separate if we want to track them separately, but for now let's just fuse them)
+        # Init with activity if needed
         fused_mask = (
             (activity_mask / 255).astype(np.uint8)
             if alignement_mask == "sam_and_activity"
             else np.zeros((W, H), dtype=np.uint8)
         )
         if alignement_mask == "all":
-            fused_mask = np.zeros((W, H), dtype=np.uint8)  # Nothing is considerer moving;
-        else:  # SAM, SAM_AND_ACTIVITY, NOTHING(just for freeze_bg)
+            fused_mask = np.zeros((W, H), dtype=np.uint8)  # Align on all pixels ; Nothing is considerer moving
+        else:  # Add SAM masks
+            output = outputs_per_frame[idx * skip_step]
             sam_mask = np.zeros((W, H), dtype=np.uint8)
             for _, mask in output.items():
                 sam_mask = np.maximum(sam_mask, mask)
@@ -897,13 +861,20 @@ def run_video(
             assert alignement_mask in ["sam", "sam_and_activity", "nothing"], (
                 "SAM must be computed to use freeze_bg, alignement_mask must be in ['sam', 'sam_and_activity']"
             )
-            aligned_depth_np[fused_mask == 0] = np.nan  # set nan out of mask;
-            aligned_depth_np2[fused_mask == 0] = np.nan  # set nan out of mask;
+            depth_for_gaussians = aligned_depth_np2.copy()
+            depth_for_gaussians[sam_mask == 0] = np.nan  # set nan out of mask;
+        else:
+            depth_for_gaussians = aligned_depth_np2
+
+        if depth_npy_dir is not None:
+            np.save(depth_npy_dir / f"depth_{idx}.npy", depth_for_gaussians.astype(np.float32))
+            np.save(depth_npy_dir / f"mask_{idx}.npy", fused_mask.astype(np.uint8))
+
         gaussians = to_gaussians(
             converter,
-            aligned_depth_np2,
+            depth_for_gaussians,
             image_tensor,
-            max(stride//2, 1),
+            stride,
             H,
             depth_min,
             depth_max,
@@ -1564,7 +1535,6 @@ def segment_with_sam(
     from sam3.model_builder import build_sam3_video_predictor
     from sam3.visualization_utils import (
         prepare_masks_for_visualization,
-        visualize_formatted_frame_output,
     )
     # use all available GPUs on the machine
     # gpus_to_use = range(torch.cuda.device_count())
