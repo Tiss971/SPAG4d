@@ -741,7 +741,18 @@ def run_video(
             # np.median / np.tensordot promote to float64; cast back to float32 so
             # the downstream GPU tensors (to_gaussians) stay fp32 (VRAM + fp64 math).
             if self.method == "median":
-                return np.median(stack, axis=0).astype(np.float32, copy=False)
+                # Exact per-pixel median via partition (kth-selection) instead of
+                # np.median's full sort — identical result, much faster for the
+                # small causal window. Odd k: the middle order statistic; even k:
+                # mean of the two middle ones (matches np.median).
+                k = stack.shape[0]
+                if k % 2 == 1:
+                    med = np.partition(stack, k // 2, axis=0)[k // 2]
+                else:
+                    lo = k // 2 - 1
+                    part = np.partition(stack, [lo, lo + 1], axis=0)
+                    med = (part[lo] + part[lo + 1]) / 2.0
+                return med.astype(np.float32, copy=False)
             # gaussian: use the tail of the full weight vector matching buffer len
             k = stack.shape[0]
             w = self._full_weights[-k:]

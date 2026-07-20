@@ -49,7 +49,7 @@ point in video.py would replace the body of the per-frame loop that calls
 the previous frame's fused mask/depth and this frame's WAFT flow.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -105,12 +105,25 @@ def compute_bidirectional_flow(
     return flow_fwd, flow_bwd
 
 
+_BASE_GRID_CACHE: dict = {}  # (H, W) -> (ys, xs) base pixel meshgrid, reused across frames
+
+
+def _base_meshgrid(H: int, W: int):
+    key = (H, W)
+    g = _BASE_GRID_CACHE.get(key)
+    if g is None:
+        ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+        g = (ys.astype(np.float32), xs.astype(np.float32))
+        _BASE_GRID_CACHE[key] = g
+    return g
+
+
 def _sample_grid_erp(H: int, W: int, flow: np.ndarray, device) -> torch.Tensor:
     """Build a grid_sample() grid for backward-warping: source coordinates
     `p - flow(p)`, wrapped modulo W on the horizontal (seam) axis and
     clamped on the vertical axis (no wraparound over the poles).
     """
-    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    ys, xs = _base_meshgrid(H, W)
     src_x = (xs - flow[..., 0]) % W  # circular wrap across the seam
     src_y = ys - flow[..., 1]
     src_y = np.clip(src_y, 0, H - 1)  # no wraparound over poles: clamp
@@ -134,6 +147,24 @@ def warp_backward(src: np.ndarray, flow: np.ndarray) -> np.ndarray:
     return out.view(H, W).cpu().numpy()
 
 
+def warp_backward_multi(srcs: list[np.ndarray], flow: np.ndarray) -> list[np.ndarray]:
+    """Backward-warp several single-channel maps that share the SAME `flow`
+    (hence the same sampling grid) in one batched grid_sample call. Numerically
+    identical to calling warp_backward() on each source, but builds the grid
+    once and does a single CPU->GPU->CPU transfer instead of one per source."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    H, W = srcs[0].shape
+    grid = _sample_grid_erp(H, W, flow, device)  # (1,H,W,2)
+    n = len(srcs)
+    src_t = torch.from_numpy(np.stack(srcs, axis=0)).float().to(device).view(n, 1, H, W)
+    out = F.grid_sample(
+        src_t, grid.expand(n, -1, -1, -1), mode="bilinear",
+        padding_mode="border", align_corners=True,
+    )
+    out = out.view(n, H, W).cpu().numpy()
+    return [out[i] for i in range(n)]
+
+
 def fb_consistency_error(flow_fwd: np.ndarray, flow_bwd: np.ndarray) -> np.ndarray:
     """Forward-backward consistency error in pixels: warp flow_bwd back
     along flow_fwd and measure how far it is from cancelling flow_fwd.
@@ -147,14 +178,23 @@ def fb_consistency_error(flow_fwd: np.ndarray, flow_bwd: np.ndarray) -> np.ndarr
     return np.sqrt(err_x**2 + err_y**2)
 
 
+_POLE_MASK_CACHE: dict = {}  # (H, W, pole_margin_frac) -> constant pole-trust mask
+
+
 def pole_trust_mask(H: int, W: int, pole_margin_frac: float = 0.08) -> np.ndarray:
     """1.0 in the trustworthy latitude band, 0.0 within `pole_margin_frac` of
-    top/bottom rows where ERP distortion makes flow unreliable."""
+    top/bottom rows where ERP distortion makes flow unreliable. Cached: it only
+    depends on (H, W, pole_margin_frac), all constant across a clip."""
+    key = (H, W, pole_margin_frac)
+    m = _POLE_MASK_CACHE.get(key)
+    if m is not None:
+        return m
     margin = int(H * pole_margin_frac)
     mask = np.ones((H, W), dtype=np.float32)
     if margin > 0:
         mask[:margin, :] = 0.0
         mask[H - margin :, :] = 0.0
+    _POLE_MASK_CACHE[key] = mask
     return mask
 
 
@@ -206,7 +246,13 @@ def composite_bg_locked(
     Returns (depth_final, alpha) where alpha is the soft object weight in [0,1].
     """
     alpha = feather_dynamic_mask(dynamic_mask, dilate_px, feather_px)
-    depth_final = alpha * object_depth + (1.0 - alpha) * depth_ref
+    # Where depth_ref is NaN ("ignore" mode), fall back entirely to object_depth.
+    # This prevents NaN propagation (0.0 * NaN = NaN) from wiping out valid object depth
+    # when alpha == 1.0, allowing the moving subject to cleanly fill the background hole.
+    ref_undefined = np.isnan(depth_ref)
+    safe_alpha = np.where(ref_undefined, 1.0, alpha)
+    safe_ref = np.where(ref_undefined, 0.0, depth_ref)
+    depth_final = safe_alpha * object_depth + (1.0 - safe_alpha) * safe_ref
     return np.clip(depth_final, 0.0, None), alpha
 
 
@@ -245,9 +291,14 @@ def propagate_depth_via_flow(
     """
     H, W = depth_curr_affine.shape
 
-    depth_propagated = warp_backward(depth_prev_final, flow_fwd)
-
-    fb_err = fb_consistency_error(flow_fwd, flow_bwd)
+    # depth propagation and the two FB-consistency warps all backward-warp along
+    # the SAME flow_fwd, so batch them into one grid_sample (identical result).
+    depth_propagated, warped_bwd_x, warped_bwd_y = warp_backward_multi(
+        [depth_prev_final, flow_bwd[..., 0], flow_bwd[..., 1]], flow_fwd
+    )
+    err_x = flow_fwd[..., 0] + warped_bwd_x
+    err_y = flow_fwd[..., 1] + warped_bwd_y
+    fb_err = np.sqrt(err_x**2 + err_y**2)
     fb_trust = (fb_err < fb_err_threshold).astype(np.float32)
     pole_trust = pole_trust_mask(H, W, pole_margin_frac)
 
