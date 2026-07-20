@@ -180,6 +180,38 @@ differ near the ERP seam, so collapsing them would change the motion mask →
 SAM3 segmentation → output. It is a correctness change, not a lossless win.
 Remaining lossless levers are minor (smoother `np.stack` copy ~13 s).
 
+## Results — GPU-resident depth chain (2026-07-20)
+
+**Can ops move to GPU without hurting VRAM?** Yes — and it was the biggest time
+win. Depth is born on the GPU (DA360) but was moved to CPU immediately, so
+align/smooth/propagate ran as numpy on 3840×1920 arrays. The whole chain now
+stays on the GPU for the winner hot path (guarded: bglock + lstsq +
+median/none smoother; any other config falls back to the numpy path):
+`align_depth_frame_gpu`, `TemporalDepthSmoother.call_torch` (kthvalue median,
+avoids `torch.quantile`'s 2^24 cap), `propagate_depth_via_flow_torch` (+
+`warp_backward_multi_torch`, cached torch meshgrid/pole mask). Composite stays
+CPU (numpy boundary for `to_gaussians`); flows transfer per-frame (cheap).
+
+fast5 winner: depth post-processing block **38 → 11 s**, whole-run
+**113 → 88.7 s**. **VRAM unchanged at 9,234 MB** — the peak is SAM3-bound and
+the chain adds only a few depth-sized tensors (~a few hundred MB), well under
+it. **Metrics byte-identical** (bg_depth_cv 0.01854882342996768, spikes
+0.027027…): align leaves background pixels untouched and kthvalue selects the
+same element as np.median, so the bg-only stability metrics don't move.
+Commit `e5b1681`.
+
+**Can it be multi-threaded/processed?** Only marginally: the loop is *causal*
+(propagation consumes the previous frame's composited depth; the smoother is a
+causal window), so frames can't be parallelized. Off-critical-path overlap
+(prefetch DA360 depth ~4 s, async PLY writes ~1.5 s) is ~5–7 s — not pursued;
+the GPU chain already removed the CPU hogs that threading would have hidden.
+
+### Cumulative result (whole effort, winner config)
+Wall time **148.8 → 88.7 s (−40%)**; peak VRAM **37,092 → 20,353 MB (−45%)**;
+stability metrics lossless throughout. VRAM is SAM3-bound; further time levers
+(align composite on GPU, Tier 3 seam-mask factorization) are minor and/or not
+lossless.
+
 ## Verification (no-regression)
 - **Per-tier VRAM**: re-run `benchmark_solutions.py` on the `bglock_sol1_median_w5` config
   over a 3–4 video subset after each tier; compare `mean_vram_max_mb` against the current
