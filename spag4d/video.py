@@ -22,6 +22,7 @@ from .flow_depth_propagation import (
     composite_bg_locked,
     compute_bidirectional_flow,
     propagate_depth_via_flow,
+    propagate_depth_via_flow_torch,
     upscale_flow,
 )
 from .ply_writer import save_ply_gsplat
@@ -726,6 +727,7 @@ def run_video(
             self.window = max(1, int(window))
             self.method = method
             self.buffer = deque(maxlen=self.window)
+            self.buffer_t = deque(maxlen=self.window)  # GPU tensors, for call_torch
             if method == "gaussian":
                 sigma = max(self.window / 6.0, 1e-3)
                 # weights over the causal window; index 0 = oldest, -1 = current
@@ -759,6 +761,25 @@ def run_video(
             w = w / w.sum()
             return np.tensordot(w, stack, axes=([0], [0])).astype(np.float32, copy=False)
 
+        def call_torch(self, depth: "torch.Tensor") -> "torch.Tensor":
+            """GPU/torch equivalent of __call__ for method="median": keeps the
+            causal window as resident cuda tensors (no np.stack host copy) and
+            takes the per-pixel median via kthvalue selection — matches
+            np.median (odd k: middle order statistic; even k: mean of the two
+            middle) without torch.quantile's 2^24-element size cap."""
+            self.buffer_t.append(depth)
+            if len(self.buffer_t) == 1:
+                return depth
+            stack = torch.stack(list(self.buffer_t), dim=0)  # (k,H,W) cuda
+            k = stack.shape[0]
+            if k % 2 == 1:
+                med = stack.kthvalue(k // 2 + 1, dim=0).values
+            else:
+                lo = stack.kthvalue(k // 2, dim=0).values
+                hi = stack.kthvalue(k // 2 + 1, dim=0).values
+                med = (lo + hi) / 2.0
+            return med.to(depth.dtype)
+
     depth_smoother = (
         TemporalDepthSmoother(depth_smoothing_window, depth_smoothing_method)
         if depth_smoothing
@@ -767,6 +788,21 @@ def run_video(
 
     depth_prev_final = None  # bg-locked mode: previous frame's composited depth, warped forward each step
     flow_state = PropagationState(decay=0.85)
+
+    # GPU-resident depth chain: for the winner hot path (bglock + lstsq align +
+    # median/none smoother) run align, smoothing and flow-propagation on the GPU
+    # (depth is already there from DA360), avoiding the per-frame numpy<->cuda
+    # round-trips. Numerically within float rounding of the numpy path, not
+    # byte-identical. Any other config falls back to the numpy path below.
+    gpu_depth_chain = (
+        depth_correction == "bglock"
+        and alignement_mask not in ("nothing", "all")
+        and alignement_method == "lstsq"
+        and (depth_smoother is None or depth_smoother.method == "median")
+        and torch.cuda.is_available()
+    )
+    depth_ref_t = torch.from_numpy(depth_ref_np).to("cuda") if gpu_depth_chain else None
+    depth_prev_t = None  # previous frame's composited depth as a cuda tensor
 
     (output_folder / "gaussians").mkdir(parents=True, exist_ok=True)
     if freeze_bg:
@@ -813,18 +849,28 @@ def run_video(
                 sam_mask = np.maximum(sam_mask, mask)
             fused_mask = np.maximum(fused_mask, sam_mask)
 
+        fused_t = torch.from_numpy(fused_mask).to("cuda") if gpu_depth_chain else None
+
         # Align depth_ref_np
         median_depth_fg.append(float(np.median(depth_np[fused_mask > 0])))
-        if alignement_mask == "nothing":
-            aligned_depth_np = depth_np
+        if gpu_depth_chain:
+            # align + smoothing on the GPU (depth is already a cuda tensor)
+            aligned_t = align_depth_frame_gpu(depth, depth_ref_t, fused_t)
+            if depth_smoother is not None:
+                aligned_t = depth_smoother.call_torch(aligned_t)
+            aligned_depth_np = aligned_t.cpu().numpy()
         else:
-            aligned_depth_np = align_depth_frame(
-                depth_np, depth_ref_np, fused_mask, alignement_method, verbose=True
-            ).copy()
-        # Solution 1: temporal depth smoothing (causal window) on the aligned depth,
-        # applied before FG stabilization / bg-locked compositing / Gaussian generation.
-        if depth_smoother is not None:
-            aligned_depth_np = depth_smoother(aligned_depth_np)
+            aligned_t = None
+            if alignement_mask == "nothing":
+                aligned_depth_np = depth_np
+            else:
+                aligned_depth_np = align_depth_frame(
+                    depth_np, depth_ref_np, fused_mask, alignement_method, verbose=True
+                ).copy()
+            # Solution 1: temporal depth smoothing (causal window) on the aligned
+            # depth, applied before FG stabilization / bg-locked compositing / GS.
+            if depth_smoother is not None:
+                aligned_depth_np = depth_smoother(aligned_depth_np)
         aligned_median_depth_fg.append(float(np.median(aligned_depth_np[fused_mask > 0])))
 
         # Background depth metrics (NEW): median depth of static regions
@@ -856,6 +902,21 @@ def run_video(
             # blend in the object depth only inside the feathered mask.
             if idx == 0 or depth_prev_final is None:
                 depth_object = aligned_depth_np.copy()
+            elif gpu_depth_chain:
+                flow_fwd_t = torch.from_numpy(flows_fwd[idx - 1]).to("cuda")
+                flow_bwd_t = torch.from_numpy(flows_bwd[idx - 1]).to("cuda")
+                depth_object_t = propagate_depth_via_flow_torch(
+                    depth_prev_t,
+                    aligned_t,
+                    depth_ref_t,
+                    flow_fwd_t,
+                    flow_bwd_t,
+                    flow_state,
+                    fb_err_threshold=fb_err_threshold,
+                    pole_margin_frac=pole_margin_frac,
+                    disocclusion_mask=fused_t,
+                )
+                depth_object = depth_object_t.cpu().numpy()
             else:
                 depth_object, _, _ = propagate_depth_via_flow(
                     depth_prev_final,
@@ -873,6 +934,8 @@ def run_video(
                 dilate_px=bg_lock_dilate_px, feather_px=bg_lock_feather_px,
             )
             depth_prev_final = aligned_depth_np2
+            if gpu_depth_chain:
+                depth_prev_t = torch.from_numpy(aligned_depth_np2).to("cuda")
         else:
             aligned_depth_np2 = fg_stabilizer(aligned_depth_np, fused_mask).copy()
         stabilized_aligned_median_depth_fg.append(
@@ -1163,6 +1226,64 @@ def align_depth_frame(
     depth_frame[~static_mask] = s * depth_frame[~static_mask] + t
 
     return np.clip(depth_frame, 0.0, None)
+
+
+def align_depth_frame_gpu(
+    depth_frame: torch.Tensor,
+    depth_ref: torch.Tensor,
+    mask_moving: torch.Tensor,
+    min_static_pixels: int = 100,
+    scale_clip: tuple = (0.5, 2.0),
+) -> torch.Tensor:
+    """GPU/torch equivalent of align_depth_frame(method="lstsq").
+
+    Fits y ~ s*x + t on static pixels via closed-form normal equations (float64
+    accumulation), clips s, and applies (s, t) to the NON-static pixels only —
+    exactly like the numpy path. Not byte-identical to it (GPU reduction order),
+    but within float rounding. All tensors are (H,W) cuda; returns a new (H,W).
+    """
+    static = (
+        (mask_moving == 0)
+        & (depth_frame > 0)
+        & (depth_ref > 0)
+        & torch.isfinite(depth_frame)
+        & torch.isfinite(depth_ref)
+    )
+    n_static = int(static.sum().item())
+    if n_static < min_static_pixels:
+        return depth_frame.clamp_min(0.0)
+
+    x = depth_frame[static]
+    y = depth_ref[static]
+    y_med = torch.median(y)
+    if float(y_med) <= 0:
+        y_med = torch.ones((), device=y.device)
+    x_norm = (x / y_med).double()
+    y_norm = (y / y_med).double()
+
+    n = x_norm.numel()
+    sx = x_norm.sum()
+    sy = y_norm.sum()
+    sxx = torch.dot(x_norm, x_norm)
+    sxy = torch.dot(x_norm, y_norm)
+    denom = n * sxx - sx * sx
+    if float(denom) == 0.0:
+        s_raw, t_raw = 0.0, float(sy / n)
+    else:
+        s_raw = float((n * sxy - sx * sy) / denom)
+        t_raw = float((sy - s_raw * sx) / n)
+    s = s_raw
+    t = t_raw * float(y_med)
+
+    s_clipped = float(np.clip(s, scale_clip[0], scale_clip[1]))
+    if s_clipped != s:
+        t = float(torch.median(y)) - s_clipped * float(torch.median(x))
+    s = s_clipped
+
+    out = depth_frame.clone()
+    nm = ~static
+    out[nm] = s * out[nm] + t
+    return out.clamp_min(0.0)
 
 
 def _estimate_scale_shift(

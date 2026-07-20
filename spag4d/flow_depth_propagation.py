@@ -333,3 +333,112 @@ def propagate_depth_via_flow(
         "depth_propagated": depth_propagated,
     }
     return depth_final, running_confidence, debug
+
+
+# ---------------------------------------------------------------------------
+# Torch/GPU-native variants
+# ---------------------------------------------------------------------------
+# These keep the whole depth-propagation chain resident on the GPU (depth is
+# born there from DA360), avoiding the per-call numpy<->cuda round-trips of the
+# numpy path above. Numerically equivalent up to float reduction order (GPU
+# sums differ from numpy at ~1e-6 relative), not byte-identical. Used by the
+# bglock fast-path in video.run_video; the numpy versions remain for other
+# configs and standalone benchmarking.
+
+_BASE_GRID_CACHE_T: dict = {}  # (H, W, device) -> (ys, xs) float32 cuda meshgrid
+_POLE_MASK_CACHE_T: dict = {}  # (H, W, pole_margin_frac, device) -> pole mask cuda
+
+
+def _base_meshgrid_torch(H: int, W: int, device):
+    key = (H, W, str(device))
+    g = _BASE_GRID_CACHE_T.get(key)
+    if g is None:
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing="ij",
+        )
+        g = (ys, xs)
+        _BASE_GRID_CACHE_T[key] = g
+    return g
+
+
+def _pole_trust_mask_torch(H: int, W: int, pole_margin_frac: float, device):
+    key = (H, W, pole_margin_frac, str(device))
+    m = _POLE_MASK_CACHE_T.get(key)
+    if m is not None:
+        return m
+    margin = int(H * pole_margin_frac)
+    mask = torch.ones((H, W), dtype=torch.float32, device=device)
+    if margin > 0:
+        mask[:margin, :] = 0.0
+        mask[H - margin :, :] = 0.0
+    _POLE_MASK_CACHE_T[key] = mask
+    return mask
+
+
+def _sample_grid_erp_torch(H: int, W: int, flow: torch.Tensor) -> torch.Tensor:
+    """Torch equivalent of _sample_grid_erp: backward-warp source coords
+    p - flow(p), wrapped mod W on x (seam) and clamped on y (poles)."""
+    ys, xs = _base_meshgrid_torch(H, W, flow.device)
+    src_x = torch.remainder(xs - flow[..., 0], W)
+    src_y = torch.clamp(ys - flow[..., 1], 0, H - 1)
+    grid_x = (src_x / (W - 1)) * 2.0 - 1.0
+    grid_y = (src_y / (H - 1)) * 2.0 - 1.0
+    return torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # (1,H,W,2)
+
+
+def warp_backward_multi_torch(srcs: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    """Backward-warp several single-channel maps (srcs: (n,H,W)) that share the
+    same `flow` (H,W,2) in one batched grid_sample. Returns (n,H,W)."""
+    n, H, W = srcs.shape
+    grid = _sample_grid_erp_torch(H, W, flow)  # (1,H,W,2)
+    out = F.grid_sample(
+        srcs.unsqueeze(1), grid.expand(n, -1, -1, -1),
+        mode="bilinear", padding_mode="border", align_corners=True,
+    )
+    return out.squeeze(1)
+
+
+def propagate_depth_via_flow_torch(
+    depth_prev_final: torch.Tensor,
+    depth_curr_affine: torch.Tensor,
+    depth_ref: torch.Tensor,
+    flow_fwd: torch.Tensor,
+    flow_bwd: torch.Tensor,
+    state: PropagationState,
+    fb_err_threshold: float = 1.5,
+    pole_margin_frac: float = 0.08,
+    disocclusion_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """GPU-native equivalent of propagate_depth_via_flow. All tensors are
+    (H,W) float32 cuda (flows (H,W,2), disocclusion_mask (H,W) any numeric).
+    Returns depth_final (H,W); state.confidence carries forward as a tensor."""
+    H, W = depth_curr_affine.shape
+    stacked = torch.stack([depth_prev_final, flow_bwd[..., 0], flow_bwd[..., 1]], dim=0)
+    warped = warp_backward_multi_torch(stacked, flow_fwd)
+    depth_propagated = warped[0]
+    err_x = flow_fwd[..., 0] + warped[1]
+    err_y = flow_fwd[..., 1] + warped[2]
+    fb_err = torch.sqrt(err_x**2 + err_y**2)
+    fb_trust = (fb_err < fb_err_threshold).float()
+    pole_trust = _pole_trust_mask_torch(H, W, pole_margin_frac, depth_curr_affine.device)
+    frame_confidence = fb_trust * pole_trust
+
+    if state.confidence is None:
+        running_confidence = frame_confidence
+    else:
+        running_confidence = torch.minimum(frame_confidence, state.confidence * state.decay)
+
+    depth_final = (
+        running_confidence * depth_propagated + (1.0 - running_confidence) * depth_curr_affine
+    )
+    if disocclusion_mask is not None:
+        reveal = (running_confidence < 0.5) & (disocclusion_mask == 0)
+        depth_final = torch.where(reveal, depth_ref, depth_final)
+
+    depth_final = depth_final.clamp_min(0.0)
+    state.confidence = torch.where(
+        frame_confidence > 0, torch.ones_like(running_confidence), running_confidence
+    )
+    return depth_final
