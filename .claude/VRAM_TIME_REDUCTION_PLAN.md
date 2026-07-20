@@ -139,6 +139,47 @@ many-object / long clips (e.g. boutique1_HQ 70 GB, vid360_bruit_operatrice 77 GB
 memory bank is a far larger share, so the offload should help substantially more —
 **validate on a high-VRAM clip next.**
 
+## Results — Time optimization (lossless, 2026-07-20)
+
+After VRAM was solved (SAM3-bound), the peak stopped moving, so the remaining
+plan tiers (Tier 2 fp16, Tier 3 WAFT factorization) are **time-only**. A fast
+single-video harness was set up for iteration: **`accident_electrique_fast5`**
+(75 frames @ 3840×1920, ~4× faster than MattSwift), isolated at
+`/raid/mb273924/_DATASETS/uptale/_bench_fast5/`, output `./benchmark_fast5/`,
+`SUMMARY_fast5.json`. (Bench caches completed configs — `rm -rf
+./benchmark_fast5/<config>` before re-running.)
+
+**Profiling the depth loop overturned the plan's assumptions.** DA360 depth is
+only ~4–5 s (3%) and PLY saving 1.5 s — neither is a bottleneck. The real
+per-frame hogs were CPU/GPU depth post-processing:
+`propagate_depth_via_flow` 32 s, temporal-median smoother 16 s,
+`align_depth_frame` 15 s.
+
+Lossless fixes implemented (`flow_depth_propagation.py`, `video.py`):
+- **Batched ERP warp** (`warp_backward_multi`): the depth warp and the two
+  FB-consistency warps all use the same `flow_fwd` grid → one batched
+  `grid_sample` (one CPU↔GPU transfer) instead of three. **32.3 → 9.6 s (−70%)**.
+- **Cached** base meshgrid (`_base_meshgrid`) and `pole_trust_mask` — constant
+  for fixed (H,W) but were rebuilt every warp/frame.
+- **Partition median** in `TemporalDepthSmoother` instead of `np.median`'s full
+  sort (exact same result). 15.8 → 13.4 s.
+- **Closed-form normal equations** in `align_depth_frame(method="lstsq")`
+  instead of `np.linalg.lstsq` SVD over ~7M pixels. Align block 44 → 38 s.
+
+**Whole-run wall time 148.8 → 113.2 s (−24%), fully lossless** — fast5
+`bg_depth_cv` (0.01854882342996768) and spikes/frame (0.027027…) byte-identical
+across every step. No VRAM change (peak stays SAM3-bound at 9,234 MB on fast5).
+Commits: `d7c833f` (batched warp + caches + partition median), `36fc85e`
+(align closed-form).
+
+**Tier 2 (fp16): dropped** — targets only the ~4 s depth model, zero VRAM
+benefit now that the peak is SAM3-bound, and carries re-validation risk.
+**Tier 3 (WAFT factorization): not pursued** — the pass-1 (mask) forward flow
+is *not* seam-padded while the pass-2 (propagation) forward flow *is*; they
+differ near the ERP seam, so collapsing them would change the motion mask →
+SAM3 segmentation → output. It is a correctness change, not a lossless win.
+Remaining lossless levers are minor (smoother `np.stack` copy ~13 s).
+
 ## Verification (no-regression)
 - **Per-tier VRAM**: re-run `benchmark_solutions.py` on the `bglock_sol1_median_w5` config
   over a 3–4 video subset after each tier; compare `mean_vram_max_mb` against the current
