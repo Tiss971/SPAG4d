@@ -477,8 +477,7 @@ def run_video(
 
         stats = model.run(waft_frames, meta, output_folder, 0.5)
         try:
-            reencode_h264(str(output_folder / "flow_mask.mp4"))
-            reencode_h264(str(output_folder / "flow_mag.mp4" ))
+            reencode_h264(str(output_folder / "flows.mp4"))
         except Exception:
             pass
         flow_masks = stats["masks"]
@@ -867,8 +866,8 @@ def run_video(
             depth_for_gaussians = aligned_depth_np2
 
         if depth_npy_dir is not None:
-            np.save(depth_npy_dir / f"depth_{idx}.npy", depth_for_gaussians.astype(np.float32))
-            np.save(depth_npy_dir / f"mask_{idx}.npy", fused_mask.astype(np.uint8))
+            np.save(depth_npy_dir / f"depth_{idx}.npy", aligned_depth_np2.astype(np.float32))
+            np.save(depth_npy_dir / f"mask_{idx}.npy", sam_mask.astype(np.uint8))
 
         gaussians = to_gaussians(
             converter,
@@ -1216,6 +1215,7 @@ def segment_with_flows(
     size_threshold: int = 50,
     prox_threshold: int = 80,
     min_times_seen: int = 3,
+    merge_gap_px: int = 30,
 
 ):
     # On prépare SAM3 vidéo
@@ -1238,7 +1238,6 @@ def segment_with_flows(
     kernel_large = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)) # Much wider to bridge the gaps
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    mask_preview = cv2.VideoWriter(output_path / 'traitement_mask.mp4', fourcc, meta['fps'], (meta['new_W'], meta['new_H']))
     boxes_preview = cv2.VideoWriter(output_path / 'boxes_input_sam.mp4', fourcc, meta['fps'], (meta['new_W'], meta['new_H']))
 
     active_tracks = []
@@ -1253,12 +1252,34 @@ def segment_with_flows(
         fg_mask = cv2.erode(fg_mask, kernel_erode, iterations=1)
         fg_mask = cv2.dilate(fg_mask, kernel_dilate, iterations=1)
 
+        def _sample_extra_points(contour, x, y, w, h, n_bands: int = 4):
+            # A single centroid seeds SAM3 with only one point -- for an elongated
+            # object (a standing/prone person) that tends to grow a mask around
+            # whichever part is most salient near that point (e.g. torso) rather
+            # than the whole silhouette, even when the flow contour itself already
+            # spans the full body. Sample a few more real interior points across
+            # the contour's height bands (median foreground x per row) so SAM3
+            # gets positive prompts spread across head/torso/legs instead of just
+            # center-of-mass. Every point is verified inside the contour, never a
+            # synthetic box-geometry interpolation that could land on background.
+            contour_mask = np.zeros((y + h, x + w), dtype=np.uint8)
+            cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
+            pts = []
+            for frac in np.linspace(0.15, 0.85, n_bands):
+                row = y + int(frac * h)
+                row = min(max(row, y), y + h - 1)
+                xs = np.nonzero(contour_mask[row, x:x + w])[0]
+                if xs.size == 0:
+                    continue
+                px = x + int(np.median(xs))
+                pts.append((px, row))
+            return pts
+
         # Find and filter contours
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         current_frame_centers = []
         bounding_boxes = []
         scores = []
-        mask_preview.write(np.stack([fg_mask] * 3, axis=-1))
         for contour in contours:
             # Filter : minimum area threshold
             # Ignore small pixels (noise)
@@ -1286,7 +1307,8 @@ def segment_with_flows(
             if M["m00"] != 0:
                 cX = int(M["m10"] / M["m00"])
                 cY = int(M["m01"] / M["m00"])
-                current_frame_centers.append((cX, cY, x, y, w, h, conf, area))
+                extra_points = _sample_extra_points(contour, x, y, w, h)
+                current_frame_centers.append((cX, cY, x, y, w, h, conf, area, extra_points))
                 bounding_boxes.append((x, y, w, h))
                 scores.append(conf)
 
@@ -1294,13 +1316,80 @@ def segment_with_flows(
                 print("no contour satisfying")
                 continue #no move found
 
-        if len(bounding_boxes) > 1:
-            print(f"Found {len(bounding_boxes)} boxes at frame {frame_idx} ! Consider implementing dnn.NMSBoxes")
+        # Merge nearby/overlapping fragment boxes (e.g. hat + shirt + pants of one
+        # person breaking apart in the flow mask) into ONE box per real object
+        # before track matching -- otherwise each fragment spawns its own track and
+        # its own SAM3 obj_id, splitting a single silhouette into several colors.
+        # Two boxes merge if they overlap or the rect-to-rect gap is <= merge_gap_px.
+        def _box_gap(b1, b2):
+            x1, y1, w1, h1 = b1
+            x2, y2, w2, h2 = b2
+            dx = max(x1 - (x2 + w2), x2 - (x1 + w1), 0)
+            dy = max(y1 - (y2 + h2), y2 - (y1 + h1), 0)
+            return max(dx, dy)
+
+        n = len(current_frame_centers)
+        parent = list(range(n))
+
+        def _find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def _union(i, j):
+            ri, rj = _find(i), _find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if _box_gap(current_frame_centers[i][2:6], current_frame_centers[j][2:6]) <= merge_gap_px:
+                    _union(i, j)
+
+        clusters: dict[int, list[int]] = {}
+        for i in range(n):
+            clusters.setdefault(_find(i), []).append(i)
+
+        merged_centers = []
+        merged_boxes = []
+        for members in clusters.values():
+            xs1, ys1, xs2, ys2, areas, confs, centroids = [], [], [], [], [], [], []
+            # Real, mask-derived points across all merged members: centroid + height-
+            # band samples. Used as SAM3 prompt points instead of geometric fractions
+            # of the merged box, which can fall in empty space for an L-shaped merge.
+            member_points = []
+            for idx in members:
+                mcx, mcy, x, y, w, h, conf, area, extra_points = current_frame_centers[idx]
+                xs1.append(x)
+                ys1.append(y)
+                xs2.append(x + w)
+                ys2.append(y + h)
+                areas.append(area)
+                confs.append(conf)
+                centroids.append((mcx, mcy))
+                member_points.append((mcx, mcy))
+                member_points.extend(extra_points)
+            mx, my = min(xs1), min(ys1)
+            mw, mh = max(xs2) - mx, max(ys2) - my
+            total_area = sum(areas)
+            merged_conf = sum(c * a for c, a in zip(confs, areas)) / total_area if total_area > 0 else 0.0
+            # Union-rect center can fall on background for an L-shaped merge; use the
+            # centroid of the largest member -- guaranteed to sit on real foreground.
+            mcX, mcY = centroids[max(range(len(members)), key=lambda k: areas[k])]
+            merged_centers.append((mcX, mcY, mx, my, mw, mh, merged_conf, total_area, member_points))
+            merged_boxes.append((mx, my, mw, mh))
+
+        if len(bounding_boxes) > len(merged_boxes):
+            print(f"Merged {len(bounding_boxes)} fragment boxes into {len(merged_boxes)} object(s) at frame {frame_idx}")
+
+        current_frame_centers = merged_centers
+        bounding_boxes = merged_boxes
 
         matched_this_frame = set()
         visual_frame = viz_frames[frame_idx].copy()
         # Match found motion regions to existing tracks, or spawn new IDs (e.g., flyaway hat)
-        for (cX, cY, x, y, w, h, conf, area) in current_frame_centers:
+        for (cX, cY, x, y, w, h, conf, area, member_points) in current_frame_centers:
             matched_obj_id: int | None = None
             best_track = None
             best_score = -1.0  # We want to MAXIMIZE IoU/Overlap instead of minimizing distance
@@ -1347,7 +1436,7 @@ def segment_with_flows(
                     matched_obj_id = track["obj_id"]
                     best_track = track
 
-            occurence = {"conf": conf,"idx": frame_idx, "center": (cX, cY), "box": (x, y, w, h),}
+            occurence = {"conf": conf, "idx": frame_idx, "center": (cX, cY), "box": (x, y, w, h), "member_points": member_points}
             # Si match, on met à jour l'objet existant in-place
             if best_track is not None:  # Sécurité : on vérifie directement l'objet
                 best_track["last_center"] = (cX, cY)
@@ -1376,9 +1465,7 @@ def segment_with_flows(
         boxes_preview.write(visual_frame)
 
     boxes_preview.release()
-    mask_preview.release()
     reencode_h264(str(output_path / 'boxes_input_sam.mp4'))
-    reencode_h264(str(output_path / 'traitement_mask.mp4'))
     print(f"-> Diagnostic preview saved: {output_path}")
 
     found_object = len(active_tracks)
@@ -1392,19 +1479,27 @@ def segment_with_flows(
 
         for s in seens:
             matched_obj_id = track['obj_id']
-            frame_idx = s['idx']
+            # s['idx'] is a DECIMATED flow-analysis index; the SAM3 session runs on the
+            # NATIVE video, so convert to native frame space (== s['idx'] when skip_step==1).
+            frame_idx = s['idx'] * skip_step
             box = abs_to_rel_coords([list(s['box'])], meta['new_W'], meta['new_H'], coord_type="box")
-            center = abs_to_rel_coords([list(s['center'])], meta['new_W'], meta['new_H'])
+            # Prompt SAM3 with several real, mask-derived points spread across the
+            # object (centroid + height-band samples from each merged fragment)
+            # instead of a single centroid -- a lone point tends to grow a mask
+            # around whichever part is most salient nearby (e.g. torso) rather
+            # than the whole silhouette, even for an elongated standing/prone body.
+            points = abs_to_rel_coords([list(p) for p in s["member_points"]], meta['new_W'], meta['new_H'])
+            point_labels = [1] * len(s["member_points"])
             # Instantly register this new independent entity directly to SAM 3
-            tqdm.write(f"[By flow] Moving object {matched_obj_id} registered at frame {frame_idx} (Coords: {str(s['center'])}) with conf={s['conf']}, seen {len(seens)} times")
+            tqdm.write(f"[By flow] Moving object {matched_obj_id} registered at frame {frame_idx} (Coords: {str(s['center'])}) with conf={s['conf']}, seen {len(seens)} times, {len(points)} points")
             o = video_predictor.handle_request(
                 request=dict(
                     type="add_prompt",
                     session_id=session_id,
                     frame_index=frame_idx,
                     obj_id=matched_obj_id,
-                    points=center,
-                    point_labels=[1],
+                    points=points,
+                    point_labels=point_labels,
                     # bounding_boxes=box,
                     # bounding_box_labels=[1],
                     # text="visual",
