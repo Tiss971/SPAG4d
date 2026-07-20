@@ -122,6 +122,23 @@ peak — the depth loop is only ~2.6 GB. To cut VRAM further, target SAM3 instea
 Keep Tier 2 (fp16) only as a **time** optimization for the depth loop, and Tier 3
 (WAFT factorization) as the main time lever, if/when time becomes the priority.
 
+### Tier 1.5 — SAM3 state offload (implemented & validated 2026-07-20)
+SAM3's per-frame inference-state memory bank lives on GPU by default and scales with
+clip length × tracked objects; with `propagation_direction="both"` and no
+`max_frame_num_to_track` cap the whole clip's state sits in VRAM. `start_session`
+accepts `offload_state_to_cpu` (plumbed to `sam3_tracking_predictor.py:79-82`, storage
+device → CPU) but the pipeline never passed it. Set `offload_state_to_cpu=True` on both
+`start_session` calls (`segment_with_flows`, `segment_with_sam`). Lossless — only moves
+where state is stored; masks/outputs unchanged. Docstring cost ~10–15% tracking fps.
+
+MattSwift (winner config): SAM3-phase / whole-run peak **23,758 → 20,353 MB (−14%)**,
+time flat (549→552 s), metrics byte-identical. **Cumulative Tier 1 + 1.5: 37,092 →
+20,353 MB = −45%, lossless.** The −14% here is a floor: MattSwift tracks ~1 object so
+the memory bank is small and the fixed image-encoder activations dominate; on
+many-object / long clips (e.g. boutique1_HQ 70 GB, vid360_bruit_operatrice 77 GB) the
+memory bank is a far larger share, so the offload should help substantially more —
+**validate on a high-VRAM clip next.**
+
 ## Verification (no-regression)
 - **Per-tier VRAM**: re-run `benchmark_solutions.py` on the `bglock_sol1_median_w5` config
   over a 3–4 video subset after each tier; compare `mean_vram_max_mb` against the current

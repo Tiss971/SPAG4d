@@ -1249,6 +1249,11 @@ def segment_with_flows(
             type="start_session",
             resource_path=str(video_path),
             offload_video_to_cpu=True,
+            # Offload the per-frame inference state (memory bank) to CPU. It scales
+            # with clip length x tracked objects and is the dominant SAM3 GPU peak
+            # for long videos; offloading trades ~10-15% tracking fps for a large
+            # VRAM saving. Masks/outputs are unchanged (lossless).
+            offload_state_to_cpu=True,
         )
     )
     session_id = initial_response["session_id"]
@@ -1664,6 +1669,9 @@ def segment_with_sam(
             type="start_session",
             resource_path=str(video_path),
             offload_video_to_cpu=True,
+            # See segment_with_flows: offload the SAM3 inference-state memory bank
+            # to CPU to cut the dominant GPU peak (~10-15% fps cost, lossless).
+            offload_state_to_cpu=True,
         )
     )
     session_id = initial_response["session_id"]
