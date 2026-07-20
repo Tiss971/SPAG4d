@@ -1,0 +1,137 @@
+# Plan: Reduce VRAM (and time) for the winner config `bglock_sol1_median_w5`
+
+_Dated 2026-07-20. Target: the production winner from `benchmark_solutions/SUMMARY.json`._
+
+## Context
+
+The 14-video benchmark picked `bglock_sol1_median_w5` (depth_correction=`bglock` +
+temporal median depth smoothing, window=5) as the best temporal-stability config,
+but at **+28% peak VRAM (35.6 → 45.6 GB)** and +70% time vs baseline. Goal: bring VRAM
+down first (time is a welcome secondary); fp16 depth is acceptable **if** a re-benchmark
+confirms the stability metrics still hold.
+
+Investigation of `spag4d/video.py`, `spag4d/flow_depth_propagation.py`,
+`spag4d/da360_model.py`, and `spag4d/detect_opticalflow.py` found the VRAM/time is
+**not** in the smoother itself (it's a bounded 5-frame CPU deque). The real costs are:
+
+- **A suspicious +6.7 GB from `sol1` alone** even though smoothing is CPU-only — prime
+  suspect is `np.median`/`np.tensordot` promoting depth from **float32 → float64**
+  (`TemporalDepthSmoother.__call__`, `video.py:724-731`), which then flows into the GPU
+  tensors built by `to_gaussians` (`video.py:872`), doubling their size and forcing fp64
+  CUDA math. (Note the SUMMARY VRAM deltas are near-perfectly additive: baseline 35610,
+  +3307 bglock, +6666 sol1, +9981 combined — so both are real allocations, not noise.)
+- **WAFT never released**: `WAFTWrapper` is loaded at `video.py:457` and kept resident on
+  GPU through SAM3 and the entire per-frame depth loop, though unused after the flow
+  phase ends (`video.py:500`). No `del`/`empty_cache()` anywhere in `video.py`.
+- **DA360 runs fp32**: it has a built-in `autocast(enabled=self.mixed_precision)` path
+  (`da360_arch/.../da360.py:74`) but `mixed_precision` defaults `False` and `DA360Model`
+  never enables it.
+- **Redundant WAFT double-pass** (time, not VRAM): `model.run` computes forward flow then
+  discards it, keeping only magnitude masks (`detect_opticalflow.py:205-231`); bglock then
+  runs a *second* bidirectional pass (`video.py:485-500`, in-code
+  `TODO: FACTORISE TO HAVE ONE PASS ONLY` at line 490).
+
+## Approach (ordered; VRAM-first)
+
+### Tier 0 — Instrument (prerequisite, ~30 min)
+Add lightweight peak-VRAM probes at phase boundaries so every change below is measured,
+not guessed. Wrap key phases with `torch.cuda.reset_peak_memory_stats()` +
+`torch.cuda.max_memory_allocated()` logging: after the flow phase (`video.py:500`), after
+SAM teardown, and inside the per-frame depth loop. Confirm the current per-phase peak
+split (WAFT-resident vs depth-loop) before touching code.
+
+### Tier 1 — Lossless VRAM wins (no re-validation needed; output should be identical)
+1. **Fix the float64 promotion in the smoother.** In `TemporalDepthSmoother.__call__`
+   (`video.py:721-731`) cast the returned array back to `float32`
+   (`return np.median(stack, axis=0).astype(np.float32, copy=False)`, same for the
+   gaussian/tensordot branch and the passthrough). **First verify** by printing
+   `aligned_depth_np2.dtype` with/without smoothing; if float64, this is likely the bulk
+   of the +6.7 GB `sol1` VRAM. Cheapest, highest-value VRAM fix.
+2. **Free WAFT before SAM3/depth loop.** After the flow phase (`video.py:500`, inside the
+   `try`) add `del model; gc.collect(); torch.cuda.empty_cache()` (free only after the
+   bglock second pass, or after the Tier-3 factorization). Removes WAFT's resident
+   footprint during the depth loop.
+3. **`empty_cache()` at phase boundaries.** After WAFT free and after SAM3
+   `close_session`/`shutdown` (`video.py:1606-1612` / `1715-1720`) so cached blocks are
+   returned before the depth loop's peak.
+
+### Tier 2 — Validated fp16 depth (gated behind re-benchmark)
+4. **Enable DA360 mixed precision.** Thread a `mixed_precision=True` flag through
+   `DA360Model.load`/construction (`da360_model.py:111`) into the arch's existing
+   `autocast` path (`da360.py:74`). Roughly halves depth-model activation VRAM and speeds
+   the per-frame hot path. **Gate:** re-run the 14-video benchmark on the winner config
+   and confirm `bg_depth_cv`, `fg_depth_cv`, `bg_spikes_per_frame`, `fg_delta_mean` stay
+   within ~5% of the current winner values in `benchmark_solutions/SUMMARY.json`.
+
+### Tier 3 — Time win + host-RAM (secondary)
+5. **Factorize the WAFT double-pass** (`video.py:478` + `485-500`): make `model.run`
+   optionally return per-pair forward flow, and derive the magnitude mask from the
+   seam-padded bidirectional pass so WAFT runs the frames **once** instead of ~3×.
+   Recovers most of bglock's +220s. Also lets Tier-1 step 2 free WAFT immediately after a
+   single unified pass. (Time, not VRAM.)
+6. **Keep `flows_fwd/bwd` at flow-res** (≤1024) and `upscale_flow` lazily per-frame in the
+   loop instead of accumulating native-res arrays for all pairs (`video.py:495-499`).
+   Host-RAM only (O(N·H·W) → O(N·h·w)); relevant for long clips, not the VRAM metric.
+7. **Make `aligned_depth_list_cpu` optional** (`video.py:633, 853, 934-937`) — it holds
+   every frame's full-res depth in host RAM only to compute an end-of-run std map; gate it
+   behind a `--depth-std-diagnostic` flag. Host-RAM only.
+
+## Critical files
+- `spag4d/video.py` — smoother dtype (721-731), WAFT load/free (457, 500), second flow
+  pass (485-500), flows accumulation (495-499), depth loop (751-897), depth-list
+  (633/853/934-937).
+- `spag4d/da360_model.py` — `load`/`predict` (111, 163+) for the `mixed_precision` flag.
+- `da360_arch/.../da360.py:74` — existing autocast path to activate.
+- `spag4d/detect_opticalflow.py:205-231` — `WAFTWrapper.run` (for the factorization).
+- `spag4d/cli.py` — expose new flags (`--depth-mixed-precision`, `--depth-std-diagnostic`).
+
+## Results — Tier 0+1 implemented & validated (2026-07-20)
+
+Implemented in `spag4d/video.py`: `import gc`; float32 cast in `TemporalDepthSmoother`
+(Tier 1.1); `del model; gc.collect(); torch.cuda.empty_cache()` after the flow phase
+(Tier 1.2); `empty_cache()` after SAM3 (Tier 1.3); cumulative `[VRAM]` phase probes
+(Tier 0, no `reset_peak_memory_stats()` — an initial reset corrupted the benchmark's
+whole-run peak read and was removed).
+
+Single-video regression on **MattSwift** (300 frames, `bglock_sol1_median_w5`, da360):
+
+| phase | cumulative peak VRAM |
+|---|---|
+| flow (WAFT freed) | 2,717 MB |
+| **SAM3 segmentation** | **23,758 MB ← whole-run peak** |
+| depth loop | no further increase |
+
+- **Whole-run peak: 37,092 MB → 23,758 MB (−36%), lossless.** The old peak lived in the
+  **depth loop**, inflated by float64 gaussian tensors (Tier 1.1), resident WAFT (1.2),
+  and un-released cache (1.3); it is now ~2.6 GB. The binding constraint is now **SAM3**.
+- **Losslessness confirmed**: MattSwift stability metrics identical to old to 3–4 sig
+  figs (float32 rounding): bg_depth_cv 0.0004627→0.0004602, bg_delta_mean
+  0.0009239→0.0009251, fg_delta_mean 0.0070054→0.0069700, fg_depth_cv 0.8264→0.8236,
+  spikes 0→0.
+- **Time**: 462 s (batch) → 549 s (single-video) is a **cold-start artifact** (DA360
+  load + cuDNN autotune amortized in the 14-video batch, paid inline here), not a
+  regression — the loop is byte-identical.
+
+### Revised next step (supersedes Tier 2 for the VRAM goal)
+Since the peak is now **SAM3 (23.8 GB)**, fp16 depth (Tier 2) would **not** lower the
+peak — the depth loop is only ~2.6 GB. To cut VRAM further, target SAM3 instead:
+- **Tier 1.5 — SAM3 VRAM**: inspect `segment_with_flows`/`segment_with_sam`
+  (`video.py:~1223/1638`). `offload_video_to_cpu=True` is already set. Look at the model
+  size/precision, the tracked-object window, and whether the whole clip is held in the
+  predictor session at once; consider chunking long clips through `propagate_in_video`.
+Keep Tier 2 (fp16) only as a **time** optimization for the depth loop, and Tier 3
+(WAFT factorization) as the main time lever, if/when time becomes the priority.
+
+## Verification (no-regression)
+- **Per-tier VRAM**: re-run `benchmark_solutions.py` on the `bglock_sol1_median_w5` config
+  over a 3–4 video subset after each tier; compare `mean_vram_max_mb` against the current
+  45591 MB in `benchmark_solutions/SUMMARY.json`. Tier 1 alone should recover most of the
+  sol1 +6.7 GB and the WAFT residency; report the new split from the Tier-0 probes.
+- **Losslessness (Tier 1)**: on one video, confirm output PLYs / `depth_metrics` are
+  unchanged (bit-identical or within float32 rounding) vs the current winner — Tier 1 is
+  meant to change memory, not results.
+- **fp16 gate (Tier 2)**: full 14-video benchmark; the four stability metrics
+  (`bg_depth_cv`, `fg_depth_cv`, `bg_spikes_per_frame`, `fg_delta_mean`) must stay within
+  ~5% of current winner values, else keep fp16 off by default.
+- **Time (Tier 3)**: compare `mean_time_seconds` vs current 737.5 s; factorization should
+  move it toward the `sol1_median_w5`-alone figure (506 s).

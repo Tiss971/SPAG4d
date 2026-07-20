@@ -1,3 +1,4 @@
+import gc
 import os
 import time
 from pathlib import Path
@@ -498,6 +499,15 @@ def run_video(
                 flows_fwd.append(ff)
                 flows_bwd.append(fb)
             print(f"  {n_total_frames - 1} pairs in {time.time() - t0:.1f}s")
+        # WAFT is unused after the flow phase (only waft_frames numpy is needed
+        # by SAM); free it so it doesn't stay resident on GPU through SAM3 and
+        # the entire per-frame depth loop.
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            print(f"[VRAM] cumulative peak through flow phase (WAFT freed): "
+                  f"{torch.cuda.max_memory_allocated() / 1024**2:.0f} MB")
     except Exception as e:
         print(f"  [ERROR during inference] {e}")
         import traceback
@@ -512,6 +522,12 @@ def run_video(
         else:
             outputs_per_frame = segment_with_flows(str(video_path), output_folder, waft_frames, flow_masks, meta, n_total_frames, skip_step)
         print(f"[SPAG4D] Background/Front segmentation of video completed in {(time.time() - startsam):.2f}s")
+        # Return SAM3's cached GPU blocks before the depth loop's peak.
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            print(f"[VRAM] cumulative peak through SAM3 segmentation: "
+                  f"{torch.cuda.max_memory_allocated() / 1024**2:.0f} MB")
 
     # Solution 5: mask quality diagnostics (diagnostic only, no pipeline change)
     if mask_diagnostics:
@@ -722,13 +738,15 @@ def run_video(
             if len(self.buffer) == 1:
                 return depth
             stack = np.stack(self.buffer, axis=0)  # [k, H, W]
+            # np.median / np.tensordot promote to float64; cast back to float32 so
+            # the downstream GPU tensors (to_gaussians) stay fp32 (VRAM + fp64 math).
             if self.method == "median":
-                return np.median(stack, axis=0)
+                return np.median(stack, axis=0).astype(np.float32, copy=False)
             # gaussian: use the tail of the full weight vector matching buffer len
             k = stack.shape[0]
             w = self._full_weights[-k:]
             w = w / w.sum()
-            return np.tensordot(w, stack, axes=([0], [0]))
+            return np.tensordot(w, stack, axes=([0], [0])).astype(np.float32, copy=False)
 
     depth_smoother = (
         TemporalDepthSmoother(depth_smoothing_window, depth_smoothing_method)
@@ -907,6 +925,10 @@ def run_video(
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_folder / "_motion_mask_stats.png")
+
+    if torch.cuda.is_available():
+        print(f"[VRAM] cumulative peak after depth loop (whole-run peak): "
+              f"{torch.cuda.max_memory_allocated() / 1024**2:.0f} MB")
 
     processing_time = time.time() - start_time
     file_size = (output_folder / "gaussians" / f"frame_{idx}.ply").stat().st_size
