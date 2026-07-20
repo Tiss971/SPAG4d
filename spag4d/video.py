@@ -1179,9 +1179,23 @@ def _estimate_scale_shift(
     """
 
     if method == "lstsq":
-        A = np.vstack([x, np.ones(len(x))]).T
-        result = np.linalg.lstsq(A, y, rcond=None)
-        s, t = result[0]
+        # Closed-form normal equations for the 2-parameter fit y ~ s*x + t.
+        # Mathematically identical to np.linalg.lstsq's solution but O(N) with a
+        # few reductions instead of building an (N,2) matrix and running SVD over
+        # millions of static pixels. Accumulate in float64 for stability.
+        x64 = x.astype(np.float64, copy=False)
+        y64 = y.astype(np.float64, copy=False)
+        n = x64.size
+        sx = x64.sum()
+        sy = y64.sum()
+        sxx = np.dot(x64, x64)
+        sxy = np.dot(x64, y64)
+        denom = n * sxx - sx * sx
+        if denom == 0.0:
+            s, t = 0.0, sy / n
+        else:
+            s = (n * sxy - sx * sy) / denom
+            t = (sy - s * sx) / n
         return float(s), float(t)
 
     elif method == "ransac":
