@@ -1,6 +1,8 @@
+import contextlib
 import gc
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -8,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from sam3.model_builder import build_sam3_video_predictor
 from sam3.visualization_utils import (
     prepare_masks_for_visualization,
@@ -511,12 +514,33 @@ def run_video(
                 flows_bwd.append(fb)
             print(f"  {n_total_frames - 1} pairs (single pass) in {time.time() - t0:.1f}s")
         else:
-            stats = model.run(waft_frames, meta, output_folder, 0.5)
+            # Tier 4.7 (opt-in, SPAG_MASK_SCALE<1.0): SAM3 prompting only needs
+            # a motion *mask*, not sub-pixel flow, so run the mask-only pass on
+            # a further-downscaled copy of waft_frames and upsample the binary
+            # mask back — the full-res bidirectional pass below (used for
+            # depth propagation) is untouched. NOT lossless: coarser flow ->
+            # different magnitude-threshold boundary -> different SAM prompts;
+            # gate behind the same re-benchmark discipline as SPAG_SINGLE_PASS.
+            mask_scale = float(os.environ.get("SPAG_MASK_SCALE", "1.0"))
+            if mask_scale < 1.0:
+                mW = max(int(waft_frames.shape[2] * mask_scale) & ~1, 2)
+                mH = max(int(waft_frames.shape[1] * mask_scale) & ~1, 2)
+                mask_frames = np.stack([
+                    cv2.resize(f, (mW, mH), interpolation=cv2.INTER_AREA) for f in waft_frames
+                ])
+                print(f"[SPAG4D] Mask-only WAFT pass downscaled to {mW}x{mH} (SPAG_MASK_SCALE={mask_scale})...")
+                stats = model.run(mask_frames, meta, output_folder, 0.5)
+                flow_masks = np.stack([
+                    cv2.resize(m, (waft_frames.shape[2], waft_frames.shape[1]), interpolation=cv2.INTER_NEAREST)
+                    for m in stats["masks"]
+                ])
+            else:
+                stats = model.run(waft_frames, meta, output_folder, 0.5)
+                flow_masks = stats["masks"]
             try:
                 reencode_h264(str(output_folder / "flows.mp4"))
             except Exception:
                 pass
-            flow_masks = stats["masks"]
 
             if depth_correction == "bglock":
                 # Bidirectional flow (seam-padded, forward-backward consistency)
@@ -852,14 +876,52 @@ def run_video(
         depth_npy_dir = Path(depth_npy_dir)
         depth_npy_dir.mkdir(parents=True, exist_ok=True)
     n_gaussians = []
+    # Tier 4.5: async PLY writes. save_ply_gsplat's GPU->CPU sync, numpy
+    # encoding and disk I/O are pure post-processing on already-computed
+    # gaussians for frame i; they don't gate frame i+1's GPU work, so hand
+    # them to a background thread and only join before anything downstream
+    # reads the files (right after the loop). Lossless: same bytes, written
+    # off the critical path. max_workers=2 keeps disk I/O bounded.
+    ply_executor = ThreadPoolExecutor(max_workers=2)
+    ply_futures = []
+    # Tier 4.4: prefetch DA360 depth for frame i+1. depth_engine.predict is a
+    # GPU op; issuing it before frame i's CPU/host-sync-heavy post-processing
+    # (align/smoother/propagate/composite, several .cpu()/.item() calls) lets
+    # its kernels queue and run on the GPU while the host is busy with frame
+    # i's bookkeeping, instead of waiting until frame i+1's loop iteration to
+    # even launch it. Purely a scheduling reorder — depth values are
+    # unchanged (same predict() call, same inputs), so output is lossless.
+    # Run the prefetch on its own CUDA stream so its kernels can actually
+    # execute concurrently with the main stream's post-processing, instead of
+    # just being queued after it (same-stream ordering wouldn't overlap
+    # anything — the host-blocking .cpu()/.item() sync points in the
+    # align/smoother/propagate block only drain the *current* stream).
+    depth_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+    def _predict_depth(frame_np):
+        stream_ctx = torch.cuda.stream(depth_stream) if depth_stream is not None else contextlib.nullcontext()
+        with stream_ctx:
+            image_tensor = torch.from_numpy(frame_np).to("cuda", non_blocking=True)
+            with torch.inference_mode():
+                depth_raw, _ = depth_engine.predict(image_tensor, temporal_consistency=temporal_consistency)
+        return image_tensor, depth_raw
+
+    next_depth_result = _predict_depth(viz_frames[0])
     for idx, frame in enumerate(tqdm(viz_frames)):
         # Depth estimation
         start_depth = time.time()
         W, H, _ = frame.shape
-        image_tensor = torch.from_numpy(frame).to("cuda")
-        with torch.inference_mode():
-            # Use temporal_consistency mode (if requested) for consistency across frames
-            depth_raw, _ = depth_engine.predict(image_tensor, temporal_consistency=temporal_consistency)
+        if depth_stream is not None:
+            torch.cuda.current_stream().wait_stream(depth_stream)
+        image_tensor, depth_raw = next_depth_result
+        if depth_stream is not None:
+            # Tell the caching allocator these were allocated on depth_stream
+            # but are now live on the default stream, so it doesn't recycle
+            # their blocks until this stream's consuming ops finish too.
+            image_tensor.record_stream(torch.cuda.current_stream())
+            depth_raw.record_stream(torch.cuda.current_stream())
+        if idx + 1 < len(viz_frames):
+            next_depth_result = _predict_depth(viz_frames[idx + 1])
         depth = depth_raw * global_scale
         if temporal_consistency:
             depth *= scale_factor_to_5m
@@ -1031,12 +1093,17 @@ def run_video(
 
         # Save PLY
         n_gaussians.append(gaussians["means"].shape[0])
-        save_ply_gsplat(
+        ply_futures.append(ply_executor.submit(
+            save_ply_gsplat,
             gaussians,
             str(output_folder / "gaussians" / f"frame_{idx}.ply"),
             sh_degree=0,
             colors_linear=colors_linear,
-        )
+        ))
+
+    for f in ply_futures:
+        f.result()
+    ply_executor.shutdown(wait=True)
 
     plt.figure(figsize=(12, 5))
     plt.plot(median_depth_fg, marker="o", label="Original", color="orange")
@@ -1439,11 +1506,54 @@ def segment_with_flows(
     # On prépare SAM3 vidéo
     gpus_to_use = [torch.cuda.current_device()]
     video_predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use)
+
+    # Tier 4.3 (opt-in, SPAG_SAM3_SCALE<1.0): SAM3 decodes resource_path itself at
+    # native resolution -- pass a downscaled in-memory list of PIL frames instead
+    # of a file path. load_resource_as_video_frames (sam3/model/io_utils.py)
+    # accepts `resource_path` as either a path or a list of PIL.Image, and uses
+    # exactly len(resource_path) as num_frames -- this sidesteps an earlier
+    # attempt that wrote a temporary downscaled .mp4 and pointed resource_path at
+    # it, which crashed with IndexError because SAM3's own video decoder didn't
+    # reliably reproduce the same frame count as what was written (codec-level
+    # frame drop/pad), desyncing frame_idx between the two frame-counting paths.
+    # A plain Python list has no such ambiguity: what we build is what SAM3 sees,
+    # frame-for-frame. Masks upsample back to full res below. NOT lossless:
+    # coarser input -> different contour/box detections -> different SAM3
+    # prompts and masks.
+    #
+    # IMPORTANT: this list must be built at NATIVE frame count, not from
+    # viz_frames -- viz_frames is already decimated by skip_step (len ==
+    # n_total_frames, the post-skip count), but add_prompt's frame_index
+    # (below, `s['idx'] * skip_step`) and propagate_in_video's frame indices
+    # are in NATIVE frame space. A list built from viz_frames is too short by
+    # a factor of skip_step, so add_prompt's frame_idx runs past the end of
+    # the list -> IndexError inside SAM3's own code (confirmed by a real
+    # crash). Re-decode the native video directly instead: one decode pass,
+    # exact native frame count, no re-encode/re-decode round trip like the
+    # old mp4-proxy attempt.
+    sam3_scale = float(os.environ.get("SPAG_SAM3_SCALE", "1.0"))
+    sam3_resource_path = str(video_path)
+    if sam3_scale < 1.0:
+        sW = max(int(viz_frames.shape[2] * sam3_scale) & ~1, 2)
+        sH = max(int(viz_frames.shape[1] * sam3_scale) & ~1, 2)
+        cap = cv2.VideoCapture(str(video_path))
+        sam3_resource_path = []
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            sam3_resource_path.append(
+                Image.fromarray(cv2.resize(frame_rgb, (sW, sH), interpolation=cv2.INTER_AREA))
+            )
+        cap.release()
+        print(f"[SPAG4D] SAM3 segmentation pass downscaled to {sW}x{sH} (SPAG_SAM3_SCALE={sam3_scale}), {len(sam3_resource_path)} in-memory native-frame-count frames...")
+
     # Start a session
     initial_response = video_predictor.handle_request(
         request=dict(
             type="start_session",
-            resource_path=str(video_path),
+            resource_path=sam3_resource_path,
             offload_video_to_cpu=True,
             # Offload the per-frame inference state (memory bank) to CPU. It scales
             # with clip length x tracked objects and is the dominant SAM3 GPU peak
@@ -1766,57 +1876,194 @@ def segment_with_flows(
     }
 
     outputs_per_frame = {}
+
+    def _reseed_window(anchor_idx, target_idx):
+        # Tier 4.2 chunking: a fresh propagate_in_video call on the same
+        # session does NOT reliably continue tracking an already-registered
+        # object -- confirmed via a real debug run (SPAG_SAM3_MAX_FRAMES=20 on
+        # a 75-frame clip) that showed the first frame of windows 3 and 4 came
+        # back with an EMPTY mask, i.e. the object was silently lost at the
+        # window boundary even though every frame index still got an
+        # `outputs_per_frame` entry (coverage counting alone can't catch
+        # this). Re-prompt each object explicitly at the new window's start
+        # using a centroid point derived from its last known (non-empty) mask
+        # at `anchor_idx`, so propagate_in_video has something real to
+        # continue from instead of silently dropping the object.
+        anchor_out = outputs_per_frame.get(anchor_idx)
+        if anchor_out is None:
+            return
+        for i, obj_id in enumerate(anchor_out['out_obj_ids']):
+            mask = anchor_out['out_binary_masks'][i]
+            if not mask.any():
+                continue
+            ys, xs = np.where(mask)
+            mh, mw = mask.shape[:2]
+            cx, cy = float(xs.mean()) / mw, float(ys.mean()) / mh
+            video_predictor.handle_request(
+                request=dict(
+                    type="add_prompt",
+                    session_id=session_id,
+                    frame_index=target_idx,
+                    obj_id=int(obj_id),
+                    points=[[cx, cy]],
+                    point_labels=[1],
+                )
+            )
+
+    def _consume_response(response):
+        frame_idx = response["frame_index"]
+        frame_output = response["outputs"]
+        outputs_per_frame[frame_idx] = frame_output
+
+        if frame_idx % 50 == 0:
+            print_gpu_stats(f'in propagate : step {frame_idx}')
+
+        # frame_output contains a mapping of {obj_id: mask_data}
+        assert isinstance(frame_output, dict)
+
+        # Blank canvas matching target dimensions
+        accumulated_mask = np.zeros((meta['new_H'], meta['new_W']), dtype=np.uint8)
+        separated_mask = np.zeros((meta['new_H'], meta['new_W'], 3), dtype=np.uint8)
+
+        # Merge ALL independent object mask layers tracking across the frame session
+        for idx, mask in enumerate(frame_output['out_binary_masks']):
+            if mask.dtype == bool:
+                mask = mask.astype(np.uint8) * 255
+
+            if mask.shape[:2] != (meta['new_H'], meta['new_W']):
+                mask = cv2.resize(mask, (meta['new_W'], meta['new_H']), interpolation=cv2.INTER_NEAREST)
+
+            # Combine via logical OR so any moving item (person OR hat) gets added
+            accumulated_mask = cv2.bitwise_or(accumulated_mask, mask)
+            # Random color for each mask
+            # Récupération de l'ID d'objet réel pour stabiliser la couleur
+            obj_id = frame_output['out_obj_ids'][idx]
+            color = color_map.get(obj_id, [255, 255, 255])
+            separated_mask[mask == 255, :] = color
+            boxes_xyhw = frame_output['out_boxes_xywh'][idx]
+            x_pixel = int(boxes_xyhw[0] * meta['new_W'])
+            y_pixel = int(boxes_xyhw[1] * meta['new_H'])
+            w_pixel = int(boxes_xyhw[2] * meta['new_W'])
+            h_pixel = int(boxes_xyhw[3] * meta['new_H'])
+            cv2.rectangle(separated_mask, (x_pixel, y_pixel), (x_pixel + w_pixel, y_pixel + h_pixel), color, 2)
+            cv2.putText(separated_mask, f"ID:{obj_id}", (x_pixel, y_pixel - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        # Save combined black-and-white mask frame
+        mask_writer.write(np.stack([accumulated_mask] * 3, axis=-1))
+        mask_sep_writer.write(separated_mask)
+        return frame_idx
+
+    # Tier 4.2 (opt-in, SPAG_SAM3_MAX_FRAMES=<int>): bound per-call VRAM/memory-bank
+    # growth by chunking propagate_in_video into successive windows instead of one
+    # unbounded "both" call. A single capped call leaves every frame outside the
+    # cap's reach with NO SAM3 output at all (confirmed: on a 75-frame test clip,
+    # cap=20 covered only 23/38 sampled frames -- the other 68% got no real
+    # tracking). Chunking re-issues propagate_in_video repeatedly on the SAME
+    # session (so the model's memory bank / tracked-object state carries over),
+    # each call bounded to max_frame_num_to_track, walking forward from
+    # start_frame_index to the last needed native frame and backward from
+    # start_frame_index to 0 -- covering every needed frame with real tracking
+    # while still bounding how many frames are attended to per single call.
+    _max_frames_env = os.environ.get("SPAG_SAM3_MAX_FRAMES")
     try:
-        for response in video_predictor.handle_stream_request(
-            request=dict(
+        if _max_frames_env:
+            cap = int(_max_frames_env)
+            native_last_needed = (n_total_frames - 1) * skip_step
+            print(f"[SPAG4D] SAM3 propagation chunked to {cap} frames/window (SPAG_SAM3_MAX_FRAMES), "
+                  f"covering native frames 0-{native_last_needed}")
+
+            cur = start_frame_index
+            prev_last_idx = None
+            while cur <= native_last_needed and cur not in outputs_per_frame:
+                if prev_last_idx is not None:
+                    _reseed_window(prev_last_idx, cur)
+                req = dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    start_frame_index=cur,
+                    propagation_direction="forward",
+                    output_prob_thresh=0.5,
+                    max_frame_num_to_track=cap,
+                )
+                last_idx = cur - 1
+                window_start = cur
+                for response in video_predictor.handle_stream_request(request=req):
+                    last_idx = max(last_idx, _consume_response(response))
+                first_out = outputs_per_frame.get(window_start)
+                nonempty = first_out is not None and any(m.any() for m in first_out.get('out_binary_masks', []))
+                print(f"[SPAG4D][DEBUG] fwd window start={window_start} end={last_idx} "
+                      f"first-frame-nonempty={nonempty}")
+                if last_idx < cur:
+                    break  # no progress this window -- avoid an infinite loop
+                prev_last_idx = last_idx
+                cur = last_idx + 1
+
+            cur = start_frame_index - 1
+            prev_first_idx = None
+            while cur >= 0 and cur not in outputs_per_frame:
+                if prev_first_idx is not None:
+                    _reseed_window(prev_first_idx, cur)
+                req = dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    start_frame_index=cur,
+                    propagation_direction="backward",
+                    output_prob_thresh=0.5,
+                    max_frame_num_to_track=cap,
+                )
+                first_idx = cur + 1
+                for response in video_predictor.handle_stream_request(request=req):
+                    first_idx = min(first_idx, _consume_response(response))
+                if first_idx > cur:
+                    break  # no progress this window
+                prev_first_idx = first_idx
+                cur = first_idx - 1
+
+            covered = sorted(outputs_per_frame.keys())
+            needed = [idx * skip_step for idx in range(n_total_frames)]
+            n_missing = sum(1 for fi in needed if fi not in outputs_per_frame)
+            print(f"[SPAG4D] SAM3 chunked coverage: {len(covered)} real frames tracked, "
+                  f"{n_missing}/{len(needed)} needed frames still missing after chunking")
+            # Any frame still missing (e.g. object left frame / occluded at a
+            # window boundary and was never re-registered) falls back to the
+            # nearest tracked frame's output rather than crashing downstream.
+            if covered:
+                for fi in needed:
+                    if fi not in outputs_per_frame:
+                        nearest = min(covered, key=lambda c: abs(c - fi))
+                        outputs_per_frame[fi] = outputs_per_frame[nearest]
+        else:
+            propagate_request = dict(
                 type="propagate_in_video",
                 session_id=session_id,
                 start_frame_index=start_frame_index,
-                # max_frame_num_to_track=128,
                 propagation_direction="both", #both
                 output_prob_thresh=0.5, #0.5
             )
-        ):
-            frame_idx = response["frame_index"]
-            frame_output = response["outputs"]
-            outputs_per_frame[frame_idx] = frame_output
+            for response in video_predictor.handle_stream_request(
+                request=propagate_request
+            ):
+                _consume_response(response)
 
-            if frame_idx % 50 == 0:
-                print_gpu_stats(f'in propagate : step {frame_idx}')
-
-            # frame_output contains a mapping of {obj_id: mask_data}
-            assert isinstance(frame_output, dict)
-
-            # Blank canvas matching target dimensions
-            accumulated_mask = np.zeros((meta['new_H'], meta['new_W']), dtype=np.uint8)
-            separated_mask = np.zeros((meta['new_H'], meta['new_W'], 3), dtype=np.uint8)
-
-            # Merge ALL independent object mask layers tracking across the frame session
-            for idx, mask in enumerate(frame_output['out_binary_masks']):
-                if mask.dtype == bool:
-                    mask = mask.astype(np.uint8) * 255
-
-                if mask.shape[:2] != (meta['new_H'], meta['new_W']):
-                    mask = cv2.resize(mask, (meta['new_W'], meta['new_H']), interpolation=cv2.INTER_NEAREST)
-
-                # Combine via logical OR so any moving item (person OR hat) gets added
-                accumulated_mask = cv2.bitwise_or(accumulated_mask, mask)
-                # Random color for each mask
-                # Récupération de l'ID d'objet réel pour stabiliser la couleur
-                obj_id = frame_output['out_obj_ids'][idx]
-                color = color_map.get(obj_id, [255, 255, 255])
-                separated_mask[mask == 255, :] = color
-                boxes_xyhw = frame_output['out_boxes_xywh'][idx]
-                x_pixel = int(boxes_xyhw[0] * meta['new_W'])
-                y_pixel = int(boxes_xyhw[1] * meta['new_H'])
-                w_pixel = int(boxes_xyhw[2] * meta['new_W'])
-                h_pixel = int(boxes_xyhw[3] * meta['new_H'])
-                cv2.rectangle(separated_mask, (x_pixel, y_pixel), (x_pixel + w_pixel, y_pixel + h_pixel), color, 2)
-                cv2.putText(separated_mask, f"ID:{obj_id}", (x_pixel, y_pixel - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            # Save combined black-and-white mask frame
-            mask_writer.write(np.stack([accumulated_mask] * 3, axis=-1))
-            mask_sep_writer.write(separated_mask)
         outputs_per_frame = prepare_masks_for_visualization(outputs_per_frame)
+        # Tier 4.3 (SPAG_SAM3_SCALE<1.0): masks come back at the downscaled
+        # SAM3 input resolution, but downstream (run_video's per-frame depth
+        # loop) fuses them against the OUTER-SCOPE, full-native-resolution
+        # `viz_frames` array (meta['H'], meta['W']) -- NOT this function's own
+        # `viz_frames` parameter (which is actually the WAFT-scaled,
+        # max-1024-side array the caller confusingly passes in under the same
+        # name, already capped by meta['new_H']/new_W), and NOT
+        # meta['new_H']/new_W either (that's the WAFT/mask working
+        # resolution, a different knob from the true native size). Confirmed
+        # by two real crashes against each wrong target before landing on the
+        # actual native meta['H']/meta['W']. Upsample every mask there.
+        _native_H, _native_W = meta['H'], meta['W']
+        for _frame_idx, _obj_masks in outputs_per_frame.items():
+            for _obj_id, _mask in list(_obj_masks.items()):
+                if _mask.shape[:2] != (_native_H, _native_W):
+                    _mask_u8 = _mask.astype(np.uint8) if _mask.dtype == bool else _mask
+                    _obj_masks[_obj_id] = cv2.resize(
+                        _mask_u8, (_native_W, _native_H), interpolation=cv2.INTER_NEAREST
+                    )
     except Exception as e:
         print(f"Error during propagation: {e}")
     else:
@@ -1859,6 +2106,7 @@ def segment_with_sam(
     # # use only a single GPU
     gpus_to_use = [torch.cuda.current_device()]
     video_predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use)
+
     # Start a session
     initial_response = video_predictor.handle_request(
         request=dict(
@@ -1916,13 +2164,59 @@ def segment_with_sam(
 
     # we will just propagate from frame 0 to the end of the video
     outputs_per_frame = {}
-    for response in video_predictor.handle_stream_request(
-        request=dict(
+    # Tier 4.2 (opt-in, SPAG_SAM3_MAX_FRAMES=<int>): see segment_with_flows for
+    # the full rationale. Unlike segment_with_flows, this function's default
+    # propagate call is unidirectional forward from `frame_idx` (no
+    # propagation_direction / start_frame_index override), so chunking here is
+    # forward-only: repeatedly call propagate_in_video on the SAME session,
+    # each bounded to max_frame_num_to_track, walking forward until every
+    # native frame index this function's own convention needs (idx * skip_step
+    # for idx in range(n_total_frames), n_total_frames being the post-skip_step
+    # count) is actually tracked, instead of leaving everything past a single
+    # capped call with NO SAM3 output.
+    _max_frames_env = os.environ.get("SPAG_SAM3_MAX_FRAMES")
+    needed = [idx * skip_step for idx in range(n_total_frames)]
+    native_last_needed = needed[-1] if needed else 0
+    if _max_frames_env:
+        cap = int(_max_frames_env)
+        print(f"[SPAG4D] SAM3 propagation chunked to {cap} frames/window (SPAG_SAM3_MAX_FRAMES), "
+              f"covering native frames {frame_idx}-{native_last_needed}")
+        cur = frame_idx
+        while cur <= native_last_needed and cur not in outputs_per_frame:
+            req = dict(
+                type="propagate_in_video",
+                session_id=session_id,
+                start_frame_index=cur,
+                propagation_direction="forward",
+                max_frame_num_to_track=cap,
+            )
+            last_idx = cur - 1
+            for response in video_predictor.handle_stream_request(request=req):
+                fi = response["frame_index"]
+                outputs_per_frame[fi] = response["outputs"]
+                last_idx = max(last_idx, fi)
+            if last_idx < cur:
+                break  # no progress this window
+            cur = last_idx + 1
+    else:
+        propagate_request = dict(
             type="propagate_in_video",
             session_id=session_id,
         )
-    ):
-        outputs_per_frame[response["frame_index"]] = response["outputs"]
+        for response in video_predictor.handle_stream_request(
+            request=propagate_request
+        ):
+            outputs_per_frame[response["frame_index"]] = response["outputs"]
+
+    # Any frame still missing (e.g. object lost at a window boundary) falls
+    # back to the nearest tracked frame's output rather than crashing
+    # downstream. NOT lossless, only a safety net.
+    if _max_frames_env and outputs_per_frame:
+        covered = sorted(outputs_per_frame.keys())
+        for fi in needed:
+            if fi not in outputs_per_frame:
+                nearest = min(covered, key=lambda c: abs(c - fi))
+                outputs_per_frame[fi] = outputs_per_frame[nearest]
 
     outputs_per_frame = prepare_masks_for_visualization(outputs_per_frame)
     if enable_viz:

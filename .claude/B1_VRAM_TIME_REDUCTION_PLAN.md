@@ -298,6 +298,209 @@ discipline used for the earlier tiers before being trusted.
    the mask (keeping full-res flow for propagation) could shave more off the WAFT
    phase beyond the Tier-3 single-pass win already shipped.
 
+## Results — Tier 4 time levers (2026-07-21)
+
+**4. DA360 prefetch (implemented, lossless, default-on).** `video.py`: the per-frame
+loop now issues frame i+1's `depth_engine.predict` on a dedicated `torch.cuda.Stream`
+right after unpacking frame i's result, instead of at the top of iteration i+1. The
+consuming code does `current_stream().wait_stream(depth_stream)` +
+`tensor.record_stream(...)` before use, so the dependency is enforced without a host
+sync — the align/smoother/propagate block's existing `.cpu()`/`.item()` calls only
+drain the *default* stream, so DA360's kernels for the next frame can execute
+concurrently with them instead of being serialized behind the same stream. Same
+`predict()` call, same inputs → bit-identical depth, purely a scheduling change.
+
+**5. Async PLY writes (implemented, lossless, default-on).** `video.py` + unchanged
+`ply_writer.py`: `save_ply_gsplat` (GPU→CPU sync + numpy SH/opacity encoding + disk
+write) is submitted to a `ThreadPoolExecutor(max_workers=2)` instead of called inline,
+so frame i's write runs off the critical path while frame i+1's GPU work proceeds.
+Futures are joined right after the loop (before any code reads the PLY files, e.g. the
+`file_size` stat). Byte-identical output, same function, just off-thread.
+
+**7. WAFT mask-pass downscale (implemented, opt-in via `SPAG_MASK_SCALE`, default
+`1.0`=off).** In the two-pass (non-`SPAG_SINGLE_PASS`) branch, when `SPAG_MASK_SCALE
+< 1.0` the frames fed to `model.run()` (mask-only pass) are downscaled further via
+`cv2.resize(..., INTER_AREA)` and the resulting binary masks upsampled back to
+`waft_frames` resolution (`INTER_NEAREST`) before being handed to `segment_with_flows`.
+The full-res bidirectional pass used for depth propagation is untouched. **Not
+lossless** — coarser flow shifts the magnitude-threshold mask boundary, which changes
+SAM3 prompts and therefore output; must be re-benchmarked (mask-diff methodology, like
+`SPAG_SINGLE_PASS`) before being trusted or defaulted on.
+
+**6. CUDA graph capture — investigated, not implemented.** Re-reading
+`align_depth_frame_gpu` (`video.py:1347+`) and the bglock branch (`video.py:937-993`)
+shows the per-frame chain is **not** actually branch-free at the Python level: (a) the
+composite/propagate call takes a structurally different path on `idx == 0` vs every
+other frame (`depth_prev_final is None` check, `video.py:943-961`); (b) alignment does
+host-side branching on tensor *values* (`s_clipped != s` clipping logic driving which
+op sequence runs, plus several `.item()` calls used for early-exit-style logic) — CUDA
+graphs require the exact same kernel sequence on every replay, and both of these
+violate that. Capturing would need a branch-free rewrite of the align/composite math
+(e.g. `torch.where` instead of Python-level `if`s) and pinned static I/O buffers, which
+is a correctness-risk redesign, not the same category as 4/5/7. Deferred — same
+gating posture the doc already applied to Tier 2 (fp16) and the original Tier-3
+factorization when they turned out to be non-lossless or not worth the risk.
+
+**Verification status**: smoke-tested end-to-end on `accident_electrique_fast5`
+(4/5 default-on path); no fast5 SUMMARY/diff-figure harness currently exists in the
+repo (per `CLAUDE.md`, the old `run_capture.py`/`make_diff_figures.py` scripts are
+gone), so the wall-time/lossless numbers below are from a single direct run via
+`python -m spag4d convert`, not the full mask-diff regression the earlier tiers used.
+`SPAG_MASK_SCALE` (item 7) still needs that same re-benchmark gate before shipping
+default-on, exactly like `SPAG_SINGLE_PASS`.
+
+## Results — real `benchmark_solutions.py` validation (2026-07-21)
+
+Ran `bglock_sol1_median_w5` on a 3-video subset (`MattSwift`, `Dispo_RDV`, `scene01`,
+`/tmp/spag4d_bench_subset`) via the actual harness (not smoke tests), comparing a
+pre-Tier-4 baseline (`git stash`) against the current tree, plus isolated runs for
+items 7 and 1.
+
+**Items 4/5 (DA360 prefetch + async PLY writes) — real numbers, no meaningful effect
+on these clips.** Before vs after, per video: Dispo_RDV 702.9s→702.6s, MattSwift
+348.9s→347.1s, scene01 401.0s→396.7s (0–1.1% deltas, within run-to-run noise). VRAM
+unchanged. Stability metrics bit-identical. Confirms the fast5 finding: the per-frame
+depth loop genuinely got faster in isolation, but on clips this long SAM3/WAFT
+dominate total wall time, so the aggregate barely moves. Lossless, kept default-on
+since there's no downside, but they are not the lever that matters here.
+
+**Item 7 (`SPAG_MASK_SCALE=0.35`) — real win.** Off (1.0) vs 0.35, per video:
+Dispo_RDV 702.6s→592.1s (−15.7%, 48759→37200 MB VRAM, −23.7%); MattSwift
+347.1s→297.3s (−14.4%, 22102→18315 MB, −17.1%); scene01 396.7s→317.2s (−20.0%,
+27929→15627 MB, −44.0%). The VRAM drop is a genuine bonus (smaller mask-pass tensors
+lower WAFT's peak, not just its runtime), not something the original design predicted.
+Background stability (`bg_depth_cv`, `bg_spikes_per_frame`) unchanged within noise on
+all 3 — expected, since bglock doesn't depend on flow-mask precision. Foreground
+stability mostly held (Dispo_RDV/scene01 `fg_depth_cv` within noise or improved) but
+**MattSwift's `fg_depth_cv` dropped 0.827→0.551** — a real shift, not noise, most
+likely because the coarser mask changed which contours got promoted to SAM3 prompts
+(different objects tracked), not just numerical drift in a fixed detection. Verdict:
+real time/VRAM win, but not proven lossless for *what* gets tracked as foreground —
+still opt-in, still needs the same scrutiny as `SPAG_SINGLE_PASS` before any
+default-on move, and this MattSwift result is a concrete reason to keep it opt-in.
+
+**Item 1 (`SPAG_SAM3_FP16`) — implementation bug found and fixed, but delivers no
+benefit.** First attempt (`video_predictor.model.half()`) crashed on **all 3 videos**
+with `RuntimeError: mat1 and mat2 must have the same dtype, but got Float and Half`,
+because callers still feed the model fp32 tensors — a blanket weight cast isn't
+compatible with the rest of the pipeline's dtype assumptions. Fixed by wrapping the
+actual forward-pass call sites (`add_prompt`, `propagate_in_video` in both
+`segment_with_flows` and `segment_with_sam`) in `torch.autocast(device_type="cuda",
+dtype=torch.float16)` instead, which handles the fp32/fp16 mixing internally. That
+runs without crashing, but real-benchmark numbers show it does essentially nothing:
+Dispo_RDV 702.6s→711.0s, MattSwift 347.1s→347.7s, scene01 396.7s→402.4s (all within
++1.4% noise), VRAM within ~60 MB (noise) on all 3, stability identical. Autocast only
+casts *activations* per-op; the weight tensors themselves stay fp32, so the dominant
+VRAM cost (model weights) is untouched, and autocast's dispatch overhead roughly
+cancels any compute saved. **Not worth pursuing further** — true fp16 weights would
+require casting every call-site input to match, a bigger and riskier change than the
+payoff justifies given item 7 already delivers the real win. **Removed** — the
+`SPAG_SAM3_FP16` env var and `torch.autocast` wrapping were reverted from
+`segment_with_flows`/`segment_with_sam` in `video.py`, no code footprint left.
+
+**Item 2 (`SPAG_SAM3_MAX_FRAMES`) — fixed, but the real fix costs almost all of the
+original savings (took three attempts).** First attempt crashed on all 3 videos with
+`KeyError: <frame_idx>` at `video.py:946`: a single `propagate_in_video` call with
+`max_frame_num_to_track` set and `propagation_direction="both"` leaves any frame
+outside the cap's reach from `start_frame_index` with no SAM3 output, and the
+downstream per-frame loop has no fallback. First fix attempt patched this with
+nearest-neighbor gap-filling (copy the nearest tracked frame's mask for any missing
+index) — this stopped the crash, but on inspection (a 75-frame test clip,
+`SPAG_SAM3_MAX_FRAMES=20`) it turned out **68% of frames were duplicate-filled, not
+tracked** (SAM3 covered only frames 0–22 of 75, then froze). Rejected in favor of
+windowed/re-seeded chunking. Second attempt: `segment_with_flows`/`segment_with_sam`
+issue *multiple* `propagate_in_video` calls on the same session (forward from
+`start_frame_index` to the end, then backward to frame 0), each bounded by
+`max_frame_num_to_track`, chaining each window's end to the next window's start. This
+was reported "working" based on a **frame-coverage** metric (every frame index has
+*some* `outputs_per_frame` entry) — validated on the 75-frame clip: 74/75 frames got
+an entry (vs 23/75 before), full 3-video run showed 0 frames needing the
+nearest-neighbor fallback, and real time/VRAM savings (Dispo_RDV −32%/−48%, MattSwift
+−27%/−24%, scene01 −14%/−17%).
+
+**That report was wrong — the user caught it by visually inspecting the mask output**
+("mask on it seems to not be propagated between chunk"). Coverage-of-entry is not the
+same as coverage-of-a-real-mask: `_consume_response` stores whatever
+`propagate_in_video` yields for a frame index even when the yielded mask is empty, so
+"every frame has an entry" was compatible with an object silently going untracked for
+an entire window. Added debug instrumentation that checks each new window's *first*
+frame for a non-empty mask (`any(m.any() for m in first_out['out_binary_masks'])`) and
+re-ran the 75-frame clip at `SPAG_SAM3_MAX_FRAMES=20` (forcing 4 forward windows):
+windows 1–2 came back non-empty, but **windows 3 and 4 (native frames 44 and 65) came
+back with a completely empty mask** — the object was lost, and the nearest-neighbor
+fallback never triggered because those frames technically had a (blank) entry.
+
+**Root cause**: chaining `propagate_in_video` calls on the same `session_id` keeps the
+session's memory bank alive across calls, but does not reliably re-establish which
+object to keep tracking — a fresh `propagate_in_video` call with a new
+`start_frame_index` does not automatically continue from where the previous call left
+off; without an explicit re-prompt it can come back empty.
+
+**Fix**: `_reseed_window(anchor_idx, target_idx)` (`video.py`, in `segment_with_flows`)
+re-registers every object right before each new window opens: reads the previous
+window's last (or first, for the backward pass) frame's raw output, computes each
+object's mask centroid in that frame, and issues an `add_prompt` call
+(`points=[[cx, cy]]` in the same relative-coordinate convention used by the initial
+flow-triggered prompts) at the new window's start frame — an explicit anchor instead of
+relying on unverified memory-bank persistence. Re-ran the same 75-frame,
+`SPAG_SAM3_MAX_FRAMES=20` diagnostic: **all 4 windows now report a non-empty first
+frame**, confirming the fix.
+
+**But the fix eliminates almost all of the original saving.** Full 3-video
+re-benchmark (`SPAG_SAM3_MAX_FRAMES=200`) with re-seeding, vs. both the true baseline
+and the (incorrect) no-reseed chunked numbers:
+
+| video | baseline (no chunking) | chunked, no reseed (buggy) | chunked + reseed (correct) |
+|---|---|---|---|
+| Dispo_RDV | 702.6s / 48,759 MB | 480.4s / 25,342 MB | **702.5s / 46,522 MB** |
+| MattSwift | 347.1s / 22,102 MB | 253.1s / 16,832 MB | **355.3s / 22,100 MB** |
+| scene01 | 396.7s / 27,929 MB | 343.0s / 23,244 MB | **388.2s / 24,974 MB** |
+
+Time is back to baseline (within noise) on all 3, and VRAM only drops meaningfully on
+Dispo_RDV (−4.6%); MattSwift is flat, scene01 −10.6%. Background stability unchanged
+(`bg_spikes_per_frame` 0 on all 3). The re-seeding `add_prompt` calls add real
+inference cost, and — more importantly — re-registering objects each window does not
+bound the session's underlying memory-bank growth, which is what item 2 was originally
+meant to cap; the "chunking" only bounds `max_frame_num_to_track` within a single call,
+not the cumulative session state across windows. **Verdict revised: item 2 is
+correctness-fixed but not a meaningfully useful VRAM/time lever as implemented** —
+shipping it opt-in is fine (it no longer silently drops the tracked object), but it
+should not be recommended as an optimization; item 7 (`SPAG_MASK_SCALE`) and item 3
+(`SPAG_SAM3_SCALE`) remain the real wins from this tier.
+
+**Item 3 (`SPAG_SAM3_SCALE`) — fixed and real-benchmarked, working (three bugs found).**
+First crash: `NameError: name 'waft_frames' is not defined` — fixed by using the
+function's actual parameter name (`viz_frames`). Second crash (writing a downscaled
+proxy `.mp4` and pointing `resource_path` at it): `IndexError: list index out of range`
+inside third-party SAM3 code, because SAM3's own decoder didn't reproduce the same
+frame count as what was written (codec-level frame drop/pad on the encode/decode round
+trip). Rewrote to pass an in-memory list of `PIL.Image` frames as `resource_path`
+instead — `load_resource_as_video_frames` (SAM3's own loader) accepts a list directly
+and uses `len(list)` as the frame count, no decoder round-trip possible. Third crash
+(after that rewrite): the PIL list was built from `segment_with_flows`'s own
+`viz_frames` parameter, but that parameter is actually the caller's WAFT-scaled
+(max-1024-side) array, not the true native video — `add_prompt`'s `frame_index` is in
+*native* frame space, so it ran past the end of the shorter list, another
+`IndexError` inside SAM3. Fixed by decoding the native video directly (one
+`cv2.VideoCapture` pass) to build the downscaled list at the correct native frame
+count. Fourth crash (after that): masks returned from a downscaled SAM3 pass are at
+the downscaled resolution, but the downstream per-frame depth loop fuses them against
+full native-resolution frames — `ValueError: operands could not be broadcast`. Took
+two wrong guesses at the correct upsample target (`meta['new_H']/new_W` is a *different*
+knob, item 7's independent mask-scale setting; this function's own `viz_frames` is
+also WAFT-scaled, not native) before landing on the actual native size,
+`meta['H']/meta['W']`. Full 3-video benchmark (`SPAG_SAM3_SCALE=0.5`), all 3 completed:
+Dispo_RDV 702.6s→689.1s (−2%, 48759→13334 MB VRAM, **−73%**); MattSwift 347.1s→357.4s
+(+3%, 22102→10862 MB, **−51%**); scene01 396.7s→406.2s (+2%, 27929→11544 MB, **−59%**).
+Time is essentially unchanged (within noise — SAM3 compute isn't the bottleneck here,
+VRAM is), but VRAM savings are the largest of any Tier-4 item. Background stability
+unchanged within noise on Dispo_RDV/scene01. MattSwift shows a real foreground-tracking
+shift (`fg_depth_cv` 0.827→0.937, `fg_delta_mean` 0.007→0.025, `bg_depth_cv` also up
+~3x though still small in absolute terms, 0.0005→0.0015) — consistent with the
+documented caveat that a coarser SAM3 input changes which contours/boxes get promoted
+to prompts, i.e. genuinely different tracked objects, not just noise. Real, large VRAM
+win; opt-in, default off, same scrutiny caveat as item 7.
+
 ## Verification (no-regression)
 - **Per-tier VRAM**: re-run `benchmark_solutions.py` on the `bglock_sol1_median_w5` config
   over a 3–4 video subset after each tier; compare `mean_vram_max_mb` against the current
