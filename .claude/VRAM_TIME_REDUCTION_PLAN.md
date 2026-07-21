@@ -212,6 +212,52 @@ stability metrics lossless throughout. VRAM is SAM3-bound; further time levers
 (align composite on GPU, Tier 3 seam-mask factorization) are minor and/or not
 lossless.
 
+### Composite-on-GPU + Tier-3 single-pass (2026-07-21, commit `d23cb01`)
+Follow-up on the two "minor/not-lossless" levers noted above. Measured on
+`accident_electrique_fast5`, winner config `bglock + median-w5`, da360, single GPU.
+Harness: `run_capture.py` + `make_diff_figures.py`. Baseline (both off): wall **94.0 s**,
+VRAM **9,234 MB**, bg_cv 0.0185488, spikes 0.027027, fg_cv 0.0129706, fg_delta 0.0288694.
+
+**Composite-on-GPU — default ON** (`SPAG_GPU_COMPOSITE=0` to disable). Ports
+`feather_dynamic_mask` + `composite_bg_locked` to torch (`composite_bg_locked_torch`):
+square max-pool dilate + separable Gaussian conv (cv2 sigma formula) vs cv2 elliptical
+dilate/GaussianBlur. Keeps the final bg-locked composite on the GPU in the winner path.
+
+| metric | baseline | gpucomp | Δ |
+|---|---|---|---|
+| wall | 94.0 s | **88.4 s** | −6% |
+| depth_alignement block | 11.45 s | **5.81 s** | −49% (the cv2 feather was the cost) |
+| VRAM | 9,234 MB | 9,234 MB | flat |
+| bg_cv / spikes / fg_delta | — | — | **identical** |
+| fg_cv | 0.01297065 | 0.01297029 | +3.6e-7 |
+
+Depth diff: mean |Δ| **0.0036 m**, confined to the feather band (10.7% of pixels, max 12 m
+at one edge speck); SAM mask **0%** changed (composite is post-segmentation). → near-lossless,
++6% at zero VRAM → shipped default-on.
+
+**Tier-3 single-pass — opt-in** (`SPAG_SINGLE_PASS=1`). Derives the SAM magnitude mask from
+the unified bidirectional pass so WAFT runs **once** instead of twice. Seam-band mask shift
+is governed by `SPAG_SP_SEAMPAD` (default **0**):
+
+| metric | baseline | pad=64 | **pad=0 (default)** |
+|---|---|---|---|
+| wall | 94.0 s | 83.1 s | 85.5 s (−9%) |
+| VRAM | 9,234 MB | 8,468 MB | 9,234 MB |
+| bg_cv | 0.0185488 | 0.0179007 | **0.0185488 identical** |
+| spikes / fg_delta | — | shifts | **identical** |
+| fg_cv | 0.0129706 | 0.0190383 (+47%) | **0.0131906 (+1.7%)** |
+| % mask chg | — | 0.32% (grows over time) | **0.00%** |
+| % depth chg>1e-3 | — | 95.7% | **9.7%** |
+
+Root cause of the pad=64 mask shift: with WAFT's `pad_to_train_size=False`/`tiling=False`
+it runs on the raw input size, so seam-padding (W→W+2·seam_pad) changes the input width and
+— via WAFT's global receptive field — perturbs the flow *everywhere*, not just the seam.
+Fix is to drop the seam padding, not the mask pass: `seam_pad=0` makes the forward flow the
+same `infer_pair` the two-pass baseline used → mask byte-identical, and the only residual is
+fg_cv +1.7% from non-padded seam propagation of objects crossing the ERP seam (bg is locked
+to ref regardless). Getting *both* an exact mask and exact seam-padded propagation genuinely
+needs two differently-shaped WAFT inputs, so it stays opt-in behind the full re-benchmark gate.
+
 ## Verification (no-regression)
 - **Per-tier VRAM**: re-run `benchmark_solutions.py` on the `bglock_sol1_median_w5` config
   over a 3–4 video subset after each tier; compare `mean_vram_max_mb` against the current
