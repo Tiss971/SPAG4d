@@ -442,3 +442,70 @@ def propagate_depth_via_flow_torch(
         frame_confidence > 0, torch.ones_like(running_confidence), running_confidence
     )
     return depth_final
+
+
+# --- GPU compositing (feather + bg-lock) -----------------------------------
+# Torch equivalents of feather_dynamic_mask / composite_bg_locked so the final
+# bg-locked composite stays on the GPU in the fast path. NOT byte-identical to
+# the cv2/numpy versions: the dilation is a square max-pool (vs cv2's elliptical
+# structuring element) and the Gaussian blur is a separable conv with cv2's
+# sigma formula. After the feather blur these differ only by sub-pixel amounts,
+# but downstream the composite is affected inside the feathered band -> measure.
+_GAUSS_KERNEL_CACHE_T: dict = {}
+
+
+def _gauss_kernel_torch(feather_px: int, device):
+    key = (feather_px, str(device))
+    k = _GAUSS_KERNEL_CACHE_T.get(key)
+    if k is not None:
+        return k
+    ksz = 2 * feather_px + 1
+    # cv2's sigma=0 formula: 0.3*((ksz-1)*0.5 - 1) + 0.8
+    sigma = 0.3 * ((ksz - 1) * 0.5 - 1) + 0.8
+    xs = torch.arange(ksz, device=device, dtype=torch.float32) - (ksz - 1) / 2.0
+    g = torch.exp(-(xs**2) / (2 * sigma * sigma))
+    g = g / g.sum()
+    _GAUSS_KERNEL_CACHE_T[key] = (g, ksz)
+    return g, ksz
+
+
+def feather_dynamic_mask_torch(
+    mask_t: torch.Tensor, dilate_px: int = 12, feather_px: int = 9
+) -> torch.Tensor:
+    """GPU feather: wrap-pad horizontally, square-dilate, separable Gaussian
+    blur. mask_t (H,W) any numeric cuda tensor (>0 => foreground)."""
+    H, W = mask_t.shape
+    pad = max(dilate_px + feather_px, 1)
+    m = (mask_t > 0).float()
+    m = torch.cat([m[:, -pad:], m, m[:, :pad]], dim=1)  # wrap-pad seam
+    x = m.unsqueeze(0).unsqueeze(0)  # (1,1,H,Wp)
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        x = torch.nn.functional.max_pool2d(x, kernel_size=k, stride=1, padding=dilate_px)
+    if feather_px > 0:
+        g, ksz = _gauss_kernel_torch(feather_px, mask_t.device)
+        f = feather_px
+        # separable blur, reflect padding to mirror cv2's BORDER_REFLECT_101
+        xh = torch.nn.functional.pad(x, (f, f, 0, 0), mode="reflect")
+        xh = torch.nn.functional.conv2d(xh, g.view(1, 1, 1, ksz))
+        xv = torch.nn.functional.pad(xh, (0, 0, f, f), mode="reflect")
+        x = torch.nn.functional.conv2d(xv, g.view(1, 1, ksz, 1))
+    alpha = x[0, 0]
+    return alpha[:, pad : pad + W]
+
+
+def composite_bg_locked_torch(
+    object_depth: torch.Tensor,
+    depth_ref: torch.Tensor,
+    dynamic_mask: torch.Tensor,
+    dilate_px: int = 12,
+    feather_px: int = 9,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GPU equivalent of composite_bg_locked. depth_ref may contain NaN
+    ("ignore" mode) -> fall back to object_depth there."""
+    alpha = feather_dynamic_mask_torch(dynamic_mask, dilate_px, feather_px)
+    ref_undefined = torch.isnan(depth_ref)
+    safe_alpha = torch.where(ref_undefined, torch.ones_like(alpha), alpha)
+    safe_ref = torch.where(ref_undefined, torch.zeros_like(depth_ref), depth_ref)
+    depth_final = safe_alpha * object_depth + (1.0 - safe_alpha) * safe_ref
+    return depth_final.clamp_min(0.0), alpha

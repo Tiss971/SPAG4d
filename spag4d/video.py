@@ -20,6 +20,7 @@ from .detect_opticalflow import WAFTWrapper, abs_to_rel_coords
 from .flow_depth_propagation import (
     PropagationState,
     composite_bg_locked,
+    composite_bg_locked_torch,
     compute_bidirectional_flow,
     propagate_depth_via_flow,
     propagate_depth_via_flow_torch,
@@ -477,29 +478,61 @@ def run_video(
         meta["new_W"] = new_W
         meta["new_H"] = new_H
 
-        stats = model.run(waft_frames, meta, output_folder, 0.5)
-        try:
-            reencode_h264(str(output_folder / "flows.mp4"))
-        except Exception:
-            pass
-        flow_masks = stats["masks"]
-
-        if depth_correction == "bglock":
-            # Bidirectional flow (seam-padded, forward-backward consistency)
-            # for propagate_depth_via_flow. model.run() above only kept flow
-            # *magnitude masks* for SAM prompting, so this is a second WAFT
-            # pass over the same (already-downscaled) waft_frames.
-            # TODO: FACTORISE TO HAVE ONE PASS ONLY
-            print("[SPAG4D] Computing bidirectional WAFT flow for background-locked depth compositing...")
+        # Tier 3: single WAFT pass. Normally the flow phase runs WAFT twice for
+        # bglock — once forward-only (model.run) to build the SAM magnitude
+        # masks, once bidirectional+seam-padded (compute_bidirectional_flow) for
+        # depth propagation. When enabled, derive the SAM mask from the
+        # seam-padded forward flow instead, so WAFT runs once. NOT lossless: the
+        # seam-band motion mask differs -> different SAM prompts -> output shift.
+        single_pass = (
+            depth_correction == "bglock"
+            and os.environ.get("SPAG_SINGLE_PASS", "0") == "1"
+        )
+        if single_pass:
+            # seam_pad for the single unified pass. 0 (default) => the forward
+            # flow is computed on the raw (non-padded) frames, so the derived SAM
+            # magnitude mask is byte-identical to the two-pass baseline's mask
+            # (same infer_pair) — the mask shift disappears. The only thing given
+            # up vs the two-pass path is seam-crossing propagation, which bg-lock
+            # doesn't rely on (background is locked to depth_ref regardless).
+            sp_seam = int(os.environ.get("SPAG_SP_SEAMPAD", "0"))
+            Hw, Ww = waft_frames.shape[1], waft_frames.shape[2]
+            flow_masks = np.zeros((len(waft_frames), Hw, Ww), dtype=np.uint8)
+            print(f"[SPAG4D] Single-pass WAFT (seam_pad={sp_seam}): bidirectional flow + derived SAM mask...")
             t0 = time.time()
             for i in range(n_total_frames - 1):
-                ff, fb = compute_bidirectional_flow(model, waft_frames[i], waft_frames[i + 1], seam_pad=flow_seam_pad)
+                ff, fb = compute_bidirectional_flow(model, waft_frames[i], waft_frames[i + 1], seam_pad=sp_seam)
+                mag = np.sqrt(ff[..., 0] ** 2 + ff[..., 1] ** 2)
+                flow_masks[i] = (mag > 0.5).astype(np.uint8) * 255
                 if scale < 1.0:
                     ff = upscale_flow(ff, meta["H"], meta["W"])
                     fb = upscale_flow(fb, meta["H"], meta["W"])
                 flows_fwd.append(ff)
                 flows_bwd.append(fb)
-            print(f"  {n_total_frames - 1} pairs in {time.time() - t0:.1f}s")
+            print(f"  {n_total_frames - 1} pairs (single pass) in {time.time() - t0:.1f}s")
+        else:
+            stats = model.run(waft_frames, meta, output_folder, 0.5)
+            try:
+                reencode_h264(str(output_folder / "flows.mp4"))
+            except Exception:
+                pass
+            flow_masks = stats["masks"]
+
+            if depth_correction == "bglock":
+                # Bidirectional flow (seam-padded, forward-backward consistency)
+                # for propagate_depth_via_flow. model.run() above only kept flow
+                # *magnitude masks* for SAM prompting, so this is a second WAFT
+                # pass over the same (already-downscaled) waft_frames.
+                print("[SPAG4D] Computing bidirectional WAFT flow for background-locked depth compositing...")
+                t0 = time.time()
+                for i in range(n_total_frames - 1):
+                    ff, fb = compute_bidirectional_flow(model, waft_frames[i], waft_frames[i + 1], seam_pad=flow_seam_pad)
+                    if scale < 1.0:
+                        ff = upscale_flow(ff, meta["H"], meta["W"])
+                        fb = upscale_flow(fb, meta["H"], meta["W"])
+                    flows_fwd.append(ff)
+                    flows_bwd.append(fb)
+                print(f"  {n_total_frames - 1} pairs in {time.time() - t0:.1f}s")
         # WAFT is unused after the flow phase (only waft_frames numpy is needed
         # by SAM); free it so it doesn't stay resident on GPU through SAM3 and
         # the entire per-frame depth loop.
@@ -803,6 +836,12 @@ def run_video(
     )
     depth_ref_t = torch.from_numpy(depth_ref_np).to("cuda") if gpu_depth_chain else None
     depth_prev_t = None  # previous frame's composited depth as a cuda tensor
+    # Keep the final bg-locked composite (feather + blend) on the GPU too.
+    # Default on: near-lossless (bg_cv/spikes identical; fg_cv delta ~3e-7; depth
+    # differs only sub-cm in the feather band) for ~6% wall at zero VRAM cost.
+    # Not byte-identical (square dilate + conv blur vs cv2 elliptical/GaussianBlur);
+    # set SPAG_GPU_COMPOSITE=0 to fall back to the cv2/numpy composite.
+    gpu_composite = gpu_depth_chain and os.environ.get("SPAG_GPU_COMPOSITE", "1") != "0"
 
     (output_folder / "gaussians").mkdir(parents=True, exist_ok=True)
     if freeze_bg:
@@ -900,8 +939,11 @@ def run_video(
             # depth for temporal coherence, then lock every static pixel to
             # depth_ref_np (fixed camera => zero-variance background) and
             # blend in the object depth only inside the feathered mask.
+            depth_object_t = None  # set in the gpu path, reused for gpu composite
             if idx == 0 or depth_prev_final is None:
                 depth_object = aligned_depth_np.copy()
+                if gpu_composite:
+                    depth_object_t = aligned_t
             elif gpu_depth_chain:
                 flow_fwd_t = torch.from_numpy(flows_fwd[idx - 1]).to("cuda")
                 flow_bwd_t = torch.from_numpy(flows_bwd[idx - 1]).to("cuda")
@@ -916,7 +958,7 @@ def run_video(
                     pole_margin_frac=pole_margin_frac,
                     disocclusion_mask=fused_t,
                 )
-                depth_object = depth_object_t.cpu().numpy()
+                depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
             else:
                 depth_object, _, _ = propagate_depth_via_flow(
                     depth_prev_final,
@@ -929,13 +971,21 @@ def run_video(
                     pole_margin_frac=pole_margin_frac,
                     disocclusion_mask=fused_mask,
                 )
-            aligned_depth_np2, _ = composite_bg_locked(
-                depth_object, depth_ref_np, fused_mask,
-                dilate_px=bg_lock_dilate_px, feather_px=bg_lock_feather_px,
-            )
+            if gpu_composite:
+                aligned_depth_np2_t, _ = composite_bg_locked_torch(
+                    depth_object_t, depth_ref_t, fused_t,
+                    dilate_px=bg_lock_dilate_px, feather_px=bg_lock_feather_px,
+                )
+                depth_prev_t = aligned_depth_np2_t
+                aligned_depth_np2 = aligned_depth_np2_t.cpu().numpy()
+            else:
+                aligned_depth_np2, _ = composite_bg_locked(
+                    depth_object, depth_ref_np, fused_mask,
+                    dilate_px=bg_lock_dilate_px, feather_px=bg_lock_feather_px,
+                )
+                if gpu_depth_chain:
+                    depth_prev_t = torch.from_numpy(aligned_depth_np2).to("cuda")
             depth_prev_final = aligned_depth_np2
-            if gpu_depth_chain:
-                depth_prev_t = torch.from_numpy(aligned_depth_np2).to("cuda")
         else:
             aligned_depth_np2 = fg_stabilizer(aligned_depth_np, fused_mask).copy()
         stabilized_aligned_median_depth_fg.append(
