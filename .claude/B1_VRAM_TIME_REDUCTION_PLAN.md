@@ -258,6 +258,46 @@ fg_cv +1.7% from non-padded seam propagation of objects crossing the ERP seam (b
 to ref regardless). Getting *both* an exact mask and exact seam-padded propagation genuinely
 needs two differently-shaped WAFT inputs, so it stays opt-in behind the full re-benchmark gate.
 
+## Tier 4 — Ideas not yet tried (2026-07-21)
+
+Follow-up on the completed work above (VRAM now SAM3-bound at 20,353 MB; time now
+dominated by SAM3 segmentation + WAFT flow, since the depth loop is mostly
+GPU-resident and composite-on-GPU/Tier-3 single-pass already shipped). None of these
+are implemented or measured yet — each needs the same re-benchmark/diff-figure
+discipline used for the earlier tiers before being trusted.
+
+**VRAM (SAM3 is the current ceiling)**
+1. **fp16/bf16 SAM3 image-encoder weights** — same idea as the dropped DA360
+   mixed-precision tier, but aimed at the actual current bottleneck. Halves encoder
+   activation memory. Gate behind mask-quality / stability-metric re-benchmark, same
+   as Tier 2.
+2. **Cap `max_frame_num_to_track` / chunk `propagate_in_video`** — the whole clip's
+   tracking state currently lives in one session (offloaded to CPU, but unbounded by
+   clip length). Windowed/re-seeded propagation would bound peak state size instead
+   of letting it grow with clip length — expected to matter most on the long/
+   high-VRAM clips already flagged as needing follow-up (`boutique1_HQ` 70 GB,
+   `vid360_bruit_operatrice` 77 GB).
+3. **Downscale the SAM3 segmentation pass** — segment on a lower-res proxy, then
+   upsample the mask before feathering/compositing. Mask boundaries are already
+   feathered downstream, so some softening is plausibly tolerable; validate with the
+   same mask-diff methodology (`make_diff_figures.py`) used for Tier-3.
+
+**Time**
+4. **Async/prefetch DA360 depth for frame i+1** while post-processing frame i's
+   align/smoother/propagate/composite — noted earlier as "~5–7 s, not pursued," but
+   now that post-processing is GPU-resident and fast (~11 s vs the old 38 s), the
+   relative overlap opportunity is proportionally larger.
+5. **Async PLY writes** — same rationale as #4, also previously shelved for the same
+   reason (small in absolute terms, now a bigger relative share of per-frame time).
+6. **CUDA graph capture for the per-frame depth chain** — align/smoother/propagate/
+   composite is now a fixed, identical sequence of small GPU ops every frame;
+   capturing it as a CUDA graph would cut kernel-launch overhead, which matters more
+   now that each op is individually fast.
+7. **Push WAFT `scale` down further for the mask-only pass** — SAM3 prompting only
+   needs a magnitude mask, not sub-pixel flow; a lower-res single-pass estimate for
+   the mask (keeping full-res flow for propagation) could shave more off the WAFT
+   phase beyond the Tier-3 single-pass win already shipped.
+
 ## Verification (no-regression)
 - **Per-tier VRAM**: re-run `benchmark_solutions.py` on the `bglock_sol1_median_w5` config
   over a 3–4 video subset after each tier; compare `mean_vram_max_mb` against the current
