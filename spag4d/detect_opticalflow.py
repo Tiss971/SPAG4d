@@ -207,8 +207,7 @@ class WAFTWrapper:
         # n'existe que si un downscale a eu lieu en amont.
         H, W = frames[0].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        viz_w = cv2.VideoWriter(f"{out_dir}/flow_mag.mp4", fourcc, meta["fps"], (W, H))
-        mask_w = cv2.VideoWriter(f"{out_dir}/flow_mask.mp4", fourcc, meta["fps"], (W, H))
+        viz_w = cv2.VideoWriter(f"{out_dir}/flows.mp4", fourcc, meta["fps"], (W, H*2))
 
         timings, mags = [], []
         pbar = tqdm(range(len(frames) - 1), desc="[WAFT]")
@@ -223,14 +222,12 @@ class WAFTWrapper:
             masks[i] = mask
             timings.append(time.perf_counter() - t0)
             mags.append(float(mag.mean()))
-            viz_w.write(flow_to_rgb(flow))
-            mask_w.write(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
+            viz_w.write(np.concatenate([flow_to_rgb(flow), cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)], axis=0))
 
             pbar.set_postfix(fps=f"{1/np.mean(timings[-10:]):.1f}", mean_mag=f"{mags[-1]:.2f}")
 
 
         viz_w.release()
-        mask_w.release()
         return {"timings": timings, "mags": mags, "masks": masks}
 
 

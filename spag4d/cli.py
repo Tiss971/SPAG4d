@@ -75,8 +75,29 @@ def main():
               help='Per-frame depth stabilization for a fixed camera. bglock (default) locks '
                    'static pixels to the reference depth and flow-propagates the SAM3-masked '
                    'dynamic region; affine keeps the legacy per-frame affine alignment.')
-@click.option('--quantile', default=0.33, help='Quantile threshold of movement needed for pixel activity (0=small movement needed, 1=huge movement needed)')
+@click.option('--quantile', default=0.33, help='Unused by the activity mask itself (kept for output filenames/stats keys); see --activity-std-threshold')
+@click.option('--activity-std-threshold', default=10.0, type=float,
+              help='Absolute per-pixel temporal std threshold (0-255 scale) for the '
+                   'activity mask used by alignement-mask=sam_and_activity. Falls back '
+                   'to the top 1% most-varying pixels if nothing clears it.')
+@click.option('--always-masked-fill', type=click.Choice(['inpaint', 'ignore']), default='inpaint',
+              help="How to handle pixels masked in every single frame (e.g. someone sitting "
+                   "in the same spot the whole video): 'inpaint' (default) fills them with a "
+                   "plausible-but-fabricated texture before depth estimation; 'ignore' leaves "
+                   "them out of the reconstruction entirely (an honest hole) instead of "
+                   "trusting a depth guess on fake content.")
 @click.option('--freeze-bg', is_flag=True, help='Use same background for all frame')
+@click.option('--depth-smoothing', is_flag=True,
+              help='Solution 1: causal sliding-window smoothing of aligned depth over time '
+                   '(reduces frame-to-frame jitter, small lag on real motion).')
+@click.option('--depth-smoothing-window', default=5, type=int,
+              help='Window size (frames) for --depth-smoothing.')
+@click.option('--depth-smoothing-method', type=click.Choice(['median', 'gaussian']),
+              default='median', help='Smoothing method for --depth-smoothing.')
+@click.option('--reference-frames-for-median', default=1, type=int,
+              help='Solution 4: use the per-pixel median depth of N evenly-spaced frames as '
+                   'the reference depth (depth_ref), instead of a single frame. More robust '
+                   'to a one-off DA360 depth outlier on the reference frame.')
 @click.option('--skip-step', default=1, type=int, help='')
 @click.option('--depth-preview', is_flag=True, help='Save depth estimation frame-by-frame')
 def convert(
@@ -114,8 +135,14 @@ def convert(
     alignement_mask: str,
     alignement_method: str,
     depth_correction: str,
+    always_masked_fill: str,
     quantile: float,
+    activity_std_threshold: float,
     freeze_bg: bool,
+    depth_smoothing: bool,
+    depth_smoothing_window: int,
+    depth_smoothing_method: str,
+    reference_frames_for_median: int,
     skip_step: int,
     depth_preview: bool,
 ):
@@ -159,7 +186,7 @@ def convert(
     )
 
     if depth_preview:
-        depth_preview_path = output_path.parent / 'depths'
+        depth_preview_path = output_path / 'depths'
         depth_preview_path.mkdir(parents=True, exist_ok=True)
     else:
         depth_preview_path = None
@@ -217,26 +244,31 @@ def convert(
             converter,
             input_path,
             output_path,
-            generator,
+            active_generator = generator,
             get_background_method = "temporal_median",
             alignement_mask = alignement_mask,
             alignement_method = alignement_method,
             depth_correction = depth_correction,
+            activity_std_threshold = activity_std_threshold,
             quantile = quantile,
             freeze_bg = freeze_bg,
+            depth_smoothing = depth_smoothing,
+            depth_smoothing_window = depth_smoothing_window,
+            depth_smoothing_method = depth_smoothing_method,
+            reference_frames_for_median = reference_frames_for_median,
             skip_step = skip_step,
             depth_min = depth_min,
             depth_max = depth_max,
             sky_threshold = sky_threshold,
             stride=stride,
             outlier_pruning=outlier_pruning,
-            grazing_angle = 85.0, #65.0,
-            sparse_pruning = 0.1, #0.3,
+            grazing_angle = 90.0, #65.0,
+            sparse_pruning = 0.0, #0.3,
             global_scale=global_scale,
             depth_preview_path=depth_preview_path,
         )
         if not quiet:
-            click.echo(f"Converted: {result.splat_count:,} Gaussians")
+            click.echo(f"Converted: {int(sum(result.splat_count) / len(result.splat_count)):,} Gaussians (mean)")
             click.echo(f"Time: {result.processing_time:.2f}s")
     else:
         result = run_single(input_path, output_path)

@@ -23,17 +23,17 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from spag4d.core import SPAG4D
 from spag4d.video import run_video
-from batch_compare_generators import calculate_temporal_stability
 
 DEFAULT_VIDEO_DIR = "/raid/mb273924/_DATASETS/uptale/data/videos"
 
 # Fixed pipeline config shared by every run (the recommended baseline setup).
 BASE_KWARGS = dict(
-    skip_step=8,
-    stride=8,
+    skip_step=2,
+    stride=4,
     temporal_consistency=False,
     freeze_bg=True,
     outlier_pruning=0.3,
@@ -42,24 +42,87 @@ BASE_KWARGS = dict(
 )
 
 # Each config = extra kwargs layered on top of BASE_KWARGS.
-# "baseline" uses run_video defaults (lstsq align, single-frame ref, fg buffer 21).
+# "baseline" and every sol* config pin depth_correction="affine" explicitly:
+# run_video's default flipped to "bglock" after the temporal-solutions merge,
+# and these configs predate/test-against the legacy per-frame affine path —
+# without the pin they'd silently start running bglock instead of what their
+# name says.
 CONFIGS = {
-    "baseline": {},
+    "baseline": dict(depth_correction="affine"),
+    # Background-locked compositing + flow propagation (see .claude/depth_stability_benchmark.md)
+    "bglock": dict(depth_correction="bglock"),
     # Solution 1: temporal depth smoothing
-    "sol1_median_w5": dict(depth_smoothing=True, depth_smoothing_window=5,
-                           depth_smoothing_method="median"),
-    "sol1_gaussian_w5": dict(depth_smoothing=True, depth_smoothing_window=5,
-                             depth_smoothing_method="gaussian"),
-    # Solution 3: robust affine alignment methods (already supported in code)
-    "sol3_ransac": dict(alignement_method="ransac"),
-    "sol3_median": dict(alignement_method="median"),
-    # Solution 4: multi-frame depth reference
-    "sol4_ref7": dict(reference_frames_for_median=7),
-    # Solution 6: FG stabilizer tuning (baseline is buffer=21, jump=0.5)
-    "sol6_b5_j0.2": dict(fg_buffer_size=5, fg_jump_threshold=0.2),
-    "sol6_b11_j0.5": dict(fg_buffer_size=11, fg_jump_threshold=0.5),
-    "sol6_b15_j1.0": dict(fg_buffer_size=15, fg_jump_threshold=1.0),
+    "sol1_median_w5": dict(depth_correction="affine", depth_smoothing=True,
+                           depth_smoothing_window=5, depth_smoothing_method="median"),
+    # "sol1_gaussian_w5": dict(depth_correction="affine", depth_smoothing=True,
+    #                          depth_smoothing_window=5, depth_smoothing_method="gaussian"),
+    "bglock_sol1_median_w5": dict(depth_correction="bglock", depth_smoothing=True,
+                           depth_smoothing_window=5, depth_smoothing_method="median"),
+    # "sol1_median_sol4": dict(depth_correction="affine", depth_smoothing=True,
+    #                        depth_smoothing_window=5, depth_smoothing_method="median",
+    #                        reference_frames_for_median=7),
+    # # Solution 4: multi-frame depth reference
+    # "sol4_ref7": dict(depth_correction="affine", reference_frames_for_median=7),
+    # "bglock_sol4_ref7": dict(depth_correction="bglock", reference_frames_for_median=7),
+    # # Solution 6: FG stabilizer tuning (baseline is buffer=21, jump=0.5)
+    # "sol6_b5_j0.2": dict(depth_correction="affine", fg_buffer_size=5, fg_jump_threshold=0.2),
+    # "sol6_b11_j0.5": dict(depth_correction="affine", fg_buffer_size=11, fg_jump_threshold=0.5),
+    # "sol6_b15_j1.0": dict(depth_correction="affine", fg_buffer_size=15, fg_jump_threshold=1.0),
 }
+
+
+def calculate_temporal_stability(depth_metrics):
+    """
+    Calculate temporal stability metrics from depth data.
+    Focuses on: background depth stability, spikes, and foreground motion.
+    Returns dict with stability scores (lower = more stable).
+    """
+    if not depth_metrics:
+        return None
+
+    metrics = {}
+
+    # Background median depth coefficient of variation (PRIMARY METRIC)
+    bg_median = np.array(depth_metrics.get("aligned_bg_median", []))
+    bg_median_valid = bg_median[~np.isnan(bg_median)]
+    if len(bg_median_valid) >= 2:
+        bg_mean = np.mean(bg_median_valid)
+        bg_std = np.std(bg_median_valid)
+        if bg_mean > 0:
+            metrics["bg_depth_cv"] = float(bg_std / bg_mean)  # Lower = more stable
+            metrics["bg_depth_mean"] = float(bg_mean)
+            metrics["bg_depth_std"] = float(bg_std)
+
+    # Background median depth deltas (frame-to-frame spikes)
+    bg_deltas = np.array(depth_metrics.get("bg_median_deltas", []))
+    bg_deltas_valid = bg_deltas[~np.isnan(bg_deltas)]
+    if len(bg_deltas_valid) >= 1:
+        metrics["bg_delta_max"] = float(np.max(bg_deltas_valid))  # Largest spike
+        metrics["bg_delta_mean"] = float(np.mean(bg_deltas_valid))  # Avg spike
+        metrics["bg_delta_std"] = float(np.std(bg_deltas_valid))
+        # Count "significant spikes" (e.g., > 0.1m)
+        spike_threshold = 0.1
+        metrics["bg_spike_count"] = int(np.sum(bg_deltas_valid > spike_threshold))
+        metrics["bg_spikes_per_frame"] = float(metrics["bg_spike_count"] / len(bg_deltas_valid)) if len(bg_deltas_valid) > 0 else 0.0
+
+    # Foreground median depth deltas (object motion smoothness)
+    fg_deltas = np.array(depth_metrics.get("fg_median_deltas", []))
+    fg_deltas_valid = fg_deltas[~np.isnan(fg_deltas)]
+    if len(fg_deltas_valid) >= 1:
+        metrics["fg_delta_max"] = float(np.max(fg_deltas_valid))
+        metrics["fg_delta_mean"] = float(np.mean(fg_deltas_valid))
+        metrics["fg_delta_std"] = float(np.std(fg_deltas_valid))
+
+    # Foreground median depth coefficient of variation (smoothness)
+    fg_median = np.array(depth_metrics.get("stabilized_fg_median", []))
+    fg_median_valid = fg_median[~np.isnan(fg_median)]
+    if len(fg_median_valid) >= 2:
+        fg_mean = np.mean(fg_median_valid)
+        fg_std = np.std(fg_median_valid)
+        if fg_mean > 0:
+            metrics["fg_depth_cv"] = float(fg_std / fg_mean)  # Object depth stability
+
+    return metrics if metrics else None
 
 
 def find_videos(video_dir: str):
@@ -108,19 +171,24 @@ def run_config(converter, config_name, extra_kwargs, videos, gen, output_base):
                 **extra_kwargs,
             )
             elapsed = time.time() - t0
+
+            max_vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            torch.cuda.reset_peak_memory_stats() # Réinitialise pour la prochaine vidéo
+
             stab = calculate_temporal_stability(res.depth_metrics) if res.depth_metrics else None
             n_frames = len(res.splat_count) if res.splat_count else 0
             mean_splats = float(np.mean(res.splat_count)) if res.splat_count else None
             results["videos"][name] = {
                 "status": "completed",
                 "time_seconds": elapsed,
+                "vram_max_mb": max_vram_mb,
                 "n_frames": n_frames,
                 "mean_splats": mean_splats,
                 "stability": stab,
             }
             cv = stab.get("bg_depth_cv") if stab else None
             spk = stab.get("bg_spikes_per_frame") if stab else None
-            print(f"      done {elapsed:.1f}s | frames={n_frames} | "
+            print(f"      done {elapsed:.1f}s | vram={max_vram_mb:.0f}MB | frames={n_frames} | "
                   f"bg_cv={cv} | spikes/frame={spk}", flush=True)
         except Exception as e:
             import traceback
@@ -131,7 +199,7 @@ def run_config(converter, config_name, extra_kwargs, videos, gen, output_base):
         # Incremental save (resumable / monitorable)
         results_path.write_text(json.dumps(results, indent=2))
         # Free disk: the PLY sequence is not needed for metrics
-        _cleanup_plys(vid_out)
+        # _cleanup_plys(vid_out)
 
     results["end_time"] = datetime.now().isoformat()
     results_path.write_text(json.dumps(results, indent=2))
@@ -154,16 +222,19 @@ def aggregate(results):
             "fg_depth_cv", "fg_delta_mean"]
     acc = {k: [] for k in keys}
     times = []
+    vrams = []
     for name, v in results["videos"].items():
         if v.get("status") != "completed":
             continue
         times.append(v.get("time_seconds", np.nan))
+        vrams.append(v.get("vram_max_mb", np.nan))
         stab = v.get("stability") or {}
         for k in keys:
             if stab.get(k) is not None:
                 acc[k].append(stab[k])
     agg = {k: (float(np.mean(vals)) if vals else None) for k, vals in acc.items()}
     agg["mean_time_seconds"] = float(np.nanmean(times)) if times else None
+    agg["mean_vram_max_mb"] = float(np.nanmean(vrams)) if vrams else None
     agg["n_videos"] = sum(1 for v in results["videos"].values()
                           if v.get("status") == "completed")
     return agg
@@ -171,7 +242,7 @@ def aggregate(results):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gen", required=True, help="winning generator (pager|unisharp)")
+    ap.add_argument("--gen", required=True, help="winning generator (da360|pager|unisharp)")
     ap.add_argument("--configs", default="all",
                     help="comma-separated config names, or 'all'")
     ap.add_argument("--video-dir", default=DEFAULT_VIDEO_DIR)
@@ -225,7 +296,8 @@ def main():
               f"{fmt(a.get('bg_spikes_per_frame')):>10}"
               f"{fmt(a.get('fg_depth_cv')):>10}"
               f"{fmt(a.get('fg_delta_mean')):>10}"
-              f"{fmt(a.get('mean_time_seconds')):>10}")
+              f"{fmt(a.get('mean_time_seconds')):>10}"
+              f"{fmt(a.get('mean_vram_max_mb')):>10}")
     print(f"\nBaseline bg_cv = {fmt(base.get('bg_depth_cv'))} "
           f"(lower = steadier background)")
     print(f"Summary saved: {summary_path}")

@@ -232,11 +232,21 @@ def filter_gaussian_candidates(
     """
     H, W = depth_map.shape
 
-    # Depth at grid positions
-    depth_stride = depth_map[::stride, ::stride]
+    # Depth at grid positions. Must match the *center*-of-cell pixel that
+    # depth_to_gaussians actually samples for the final position/color
+    # (pixel_rows = rows*stride + stride//2), not the cell's top-left corner
+    # — otherwise a candidate can pass this check using one pixel while the
+    # real Gaussian is built from a different (possibly NaN) neighbor pixel
+    # up to `stride//2` away. That mismatch is invisible at stride=1 but
+    # leaks NaN-position Gaussians whenever depth has sharp valid/invalid
+    # boundaries (e.g. freeze_bg's per-frame NaN-masked static region) and
+    # grows with stride. See .claude/TEMPORAL_STABILITY_SUMMARY.md.
+    off = stride // 2
+    depth_stride = depth_map[off::stride, off::stride]
 
-    # ── Depth range ──
-    valid_depth = (depth_stride > depth_min) & (depth_stride < depth_max)
+    # ── Depth range ── (np.isfinite guard: NaN/Inf must never pass even if
+    # a future change reorders these checks around a negation)
+    valid_depth = np.isfinite(depth_stride) & (depth_stride > depth_min) & (depth_stride < depth_max)
 
     # ── Sky detection ──
     if sky_detection == "gradient":
@@ -246,8 +256,9 @@ def filter_gaussian_candidates(
     else:
         sky_mask_full = np.zeros((H, W), dtype=bool)
 
-    # Downsample sky mask to stride resolution (point-sampled at grid positions)
-    sky_mask_strided = sky_mask_full[::stride, ::stride]
+    # Downsample sky mask to stride resolution (point-sampled at the same
+    # center-of-cell pixel as depth_stride above, for the same reason).
+    sky_mask_strided = sky_mask_full[off::stride, off::stride]
 
     # ── Pole thinning ──
     if pole_thinning:
