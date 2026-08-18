@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import gc
 import os
 import time
@@ -148,7 +149,10 @@ def _activity_mask_from_std(std_frame: np.ndarray, abs_threshold: float, fallbac
     return mask
 
 
-def compute_temporal_median(frames_array, masks_dict: list[dict], activity_std_threshold: float = 10.0):
+def compute_temporal_median(
+    frames_array, masks_dict: list[dict], activity_std_threshold: float = 10.0, skip_step: int = 1,
+    diag_dir: "Path | None" = None, min_sample_frames: int = 0,
+):
     print("Calcul de la médiane temporelle (cela peut prendre quelques secondes)...")
     start = time.time()
     # Stack once — if viz_frames is already an ndarray, this is a no-op
@@ -162,8 +166,9 @@ def compute_temporal_median(frames_array, masks_dict: list[dict], activity_std_t
     F, H, W, C = frames_array.shape
     masks_array = np.zeros((F, H, W), dtype=bool)
     for idx in range(F):
-        if idx in masks_dict:
-            for _, mask in masks_dict[idx].items():
+        native_idx = idx * skip_step  # masks_dict is keyed by native (non-decimated) frame index
+        if native_idx in masks_dict:
+            for _, mask in masks_dict[native_idx].items():
                 # Guard against malformed SAM masks (some videos yield a
                 # degenerate 1D array instead of an (H, W) mask -> broadcast error)
                 if getattr(mask, "shape", None) != (H, W):
@@ -183,8 +188,26 @@ def compute_temporal_median(frames_array, masks_dict: list[dict], activity_std_t
         # 3. For the STD: Compute normally
         std_frame += torch.std(channel_tensor, dim=0).cpu().numpy()
 
+    sample_count = (F - masks_array.sum(axis=0)).astype(np.int32)  # (H, W): valid (unmasked) frames per pixel
     always_masked = masks_array.all(axis=0)  # (H, W): masked in every single frame
-    median_frame = np.nan_to_num(median_frame, nan=0.0)
+    # §5/bglock_open_questions.md: a pixel with a *few* unmasked samples isn't "always masked"
+    # but its median is a near-arbitrary pick from 1-4 frames, not a stable background estimate --
+    # same downstream failure mode as the zero-sample case (a bad-depth halo locked in for the
+    # whole video), just less severe. min_sample_frames (SPAG_DREF_MIN_SAMPLES) extends the same
+    # undefined/inpaint/NaN treatment to thin-coverage pixels. Default 0 preserves old behavior
+    # (only zero-sample pixels are undefined).
+    undefined = always_masked | (sample_count < min_sample_frames) if min_sample_frames > 0 else always_masked
+    if undefined.any():
+        # A pixel masked in every frame has no valid median sample; it lands here as
+        # solid black (0,0,0) -- either via nan_to_num or the implicit float->uint8 cast
+        # above. Depth models have a receptive field much larger than one pixel and
+        # hallucinate wildly wrong depth in and around a hard black hole (visible as a
+        # bad-depth halo bleeding onto real, non-masked neighbors under bglock, since
+        # depth_ref is computed once from this image and locked for the whole video).
+        # Inpaint instead so the depth model sees plausible texture, not a hole.
+        median_frame = cv2.inpaint(median_frame, (undefined.astype(np.uint8) * 255), 5, cv2.INPAINT_TELEA)
+    else:
+        median_frame = np.nan_to_num(median_frame, nan=0.0)
 
     # On peut aussi enregistrer les pixels qui varient le plus pour visualiser les zones les plus dynamiques
     std_frame /= C
@@ -192,7 +215,18 @@ def compute_temporal_median(frames_array, masks_dict: list[dict], activity_std_t
     print(f"abs threshold: {activity_std_threshold} -> active frac {(activity_mask > 0).mean():.4f}")
 
     print(f"Median computed in {(time.time() - start):.1f}s")
-    return median_frame, activity_mask, always_masked
+
+    # §9 diagnostics pass (SPAG_DIAG_CSV): D_ref sample-count map, saved once per
+    # run. The median RGB plate itself is already saved unconditionally by the
+    # caller as _temporal_median_background_masked.jpg -- no need to duplicate it.
+    if diag_dir is not None:
+        np.save(Path(diag_dir) / "diag_dref_sample_count.npy", sample_count)
+
+    if undefined.any():
+        print(f"[D_ref] {int(undefined.sum())} px undefined (zero-sample: {int(always_masked.sum())}, "
+              f"thin-coverage <{min_sample_frames}: {int((~always_masked & undefined).sum())})")
+
+    return median_frame, activity_mask, undefined
 
 
 def to_gaussians(
@@ -326,7 +360,7 @@ def run_video(
     depth_max: float | None = None,
     sky_threshold: float | None = None,
     stride: int = 8,
-    outlier_pruning: float = 0.3,
+    outlier_pruning: float = 0.1, # 0.3,
     grazing_angle: float = 85.0,  # 65.0,
     global_scale: float = 1.0,
     sparse_pruning: float = 0.1,  # 0.3,
@@ -395,6 +429,17 @@ def run_video(
         )
     if alignement_mask == "sam_and_activity":
         get_background_method = "temporal_median"
+
+    # §9 diagnostics pass (bglock_open_questions.md): SPAG_DIAG_CSV=<path.csv> turns
+    # on one CSV row per frame (affine residual, fitted scale, static-pixel flow,
+    # running_confidence summary, per-region depth deltas, per-object flow
+    # magnitude, residual-vs-latitude) plus two one-off files next to the CSV
+    # (diag_dref_sample_count.npy, saved from compute_temporal_median). Rule 13:
+    # entirely inert when unset -- no new work, no new allocations on the hot path.
+    diag_csv_path = os.environ.get("SPAG_DIAG_CSV")
+    diag_dir = Path(diag_csv_path).parent if diag_csv_path else None
+    if diag_dir is not None:
+        diag_dir.mkdir(parents=True, exist_ok=True)
 
     # Optional determinism (opt-in, default OFF). Production keeps cuDNN autotune
     # for throughput; enable for benchmarking/gating where run-to-run
@@ -679,8 +724,15 @@ def run_video(
     t0 = time.time()
     always_masked_mask = None
     if get_background_method == "temporal_median":
+        # Opt-in / default off (§5, bglock_open_questions.md): pixels seen unmasked in fewer than
+        # this many frames get the same undefined/inpaint/NaN treatment as zero-sample pixels --
+        # their median is a near-arbitrary pick from a handful of frames, not a stable D_ref
+        # estimate. Measured on a real clip: <2% of pixels fall below the doc's K~5-10 threshold,
+        # and they cluster into one contiguous region rather than scattering across the frame.
+        dref_min_samples = int(os.environ.get("SPAG_DREF_MIN_SAMPLES", "0"))
         master_background, activity_mask, always_masked_mask = compute_temporal_median(
-            viz_frames, outputs_per_frame, activity_std_threshold
+            viz_frames, outputs_per_frame, activity_std_threshold, skip_step, diag_dir=diag_dir,
+            min_sample_frames=dref_min_samples,
         )
         cv2.imwrite(output_folder / f"_temporal_activity_mask_abs{activity_std_threshold:g}.jpg", activity_mask)
     elif get_background_method == "last":
@@ -763,6 +815,12 @@ def run_video(
     depth_alignement_cumtime = 0
     gs_generation_cumtime = 0
     aligned_depth_list_cpu = []
+
+    # §4.3 metrics-side exclusion (benchmarks/BENCHMARK_RULES.md rule-12 TODO): the
+    # same magnitude gate used for the affine fit, applied to the per-frame medians
+    # that feed bg_depth_cv/fg_depth_cv. depth_ref_np is the frozen plate, so this
+    # cap is computed once and reused for every frame.
+    metrics_outlier_cap = _fit_outlier_cap(depth_ref_np)
 
     median_depth_fg = []
     aligned_median_depth_fg = []
@@ -902,7 +960,20 @@ def run_video(
     )
 
     depth_prev_final = None  # bg-locked mode: previous frame's composited depth, warped forward each step
-    flow_state = PropagationState(decay=0.85)
+    # Confidence decay now compounds over an age field warped along the flow
+    # (docs/T1_T2_P0_AUDIT.md §4.1/§4.2). SPAG_CONF_DECAY / SPAG_CONF_FLOOR expose
+    # the two constants for sweeping; SPAG_CONF_LEGACY=1 restores the pre-2026-08-17
+    # non-compounding behaviour every benchmark before that date was measured under.
+    flow_state = PropagationState(
+        decay=float(os.environ.get("SPAG_CONF_DECAY", 0.85)),
+        conf_floor=float(os.environ.get("SPAG_CONF_FLOOR", 0.5)),
+        legacy=os.environ.get("SPAG_CONF_LEGACY") == "1",
+    )
+    # SPAG_CONF_HIST=<path.json>: dump per-frame running_confidence stats, to check
+    # whether confidence collapses to zero over a sequence (bglock_open_questions §4.1).
+    conf_hist_path = os.environ.get("SPAG_CONF_HIST")
+    if conf_hist_path or diag_dir is not None:
+        flow_state.trace = []
 
     # GPU-resident depth chain: for the winner hot path (bglock + lstsq align +
     # median/none smoother) run align, smoothing and flow-propagation on the GPU
@@ -925,6 +996,45 @@ def run_video(
     # set SPAG_GPU_COMPOSITE=0 to fall back to the cv2/numpy composite.
     gpu_composite = gpu_depth_chain and os.environ.get("SPAG_GPU_COMPOSITE", "1") != "0"
 
+    # Opt-in / default off (§8, bglock_open_questions.md): the default composite
+    # linearly blends object_depth and depth_ref inside the feather band, which
+    # invents physically-meaningless mid-air depth at discontinuities. Set
+    # SPAG_HARD_DEPTH_CUTOVER=1 to select depth by nearest source instead of
+    # interpolating it (alpha stays soft for anything else that wants it).
+    hard_depth_cutover = os.environ.get("SPAG_HARD_DEPTH_CUTOVER", "0") == "1"
+
+    # Default on (SPAG_LOCK_ACTIVITY=0 to opt out): lock activity-only pixels to depth_ref
+    # instead of giving them flow-propagated object depth. `alignement_mask="sam_and_activity"`
+    # builds one fused_mask (SAM | activity) and uses it for two different jobs: which
+    # pixels to EXCLUDE FROM THE ALIGNMENT FIT (activity's real purpose -- a
+    # high-variance pixel is untrustworthy for estimating the fit) and which pixels are
+    # MOVING RIGHT NOW in the bg-lock composite. The second use is a category error:
+    # activity is a whole-video std, so one frame of motion unlocks a pixel for the
+    # entire clip, and edge flicker / chromatic aberration unlocks pixels that never
+    # move at all. Those pixels then carry propagated object depth, which preserves
+    # exactly the flicker bg-lock exists to remove (measured on
+    # circulation_site_1_edit_coupe: activity-only pixels, 3.4% of the frame, drift
+    # 16.5% mean / 211% p99 between frames, vs 0.000% p99 on locked static pixels in an
+    # alignement_mask="sam" scene). Locking them is safe because depth_ref comes from a
+    # SAM-masked temporal median -- at a pixel an object merely crosses, the median is
+    # the true background -- and the genuinely-unobservable case is already carved out
+    # separately (always_masked_mask -> depth_ref = NaN, no Gaussians).
+    # Measured downstream on the same clip: background init points 3.84M -> 0.58M (voxel
+    # dedup 5x -> 26x), foreground point count bit-identical, which is what the diagnosis
+    # predicts -- unlocked activity pixels were jittering across voxel boundaries and
+    # defeating dedup.
+    #
+    # KNOWN COST, accepted: genuinely moving background that SAM does not segment --
+    # foliage, water, a video screen, rippling fabric -- gets its GEOMETRY frozen to the
+    # temporal median. For foliage/water/fabric that is a real (small) loss of depth
+    # motion; downstream forces background velocity to exactly zero anyway, so it was
+    # never propagated into the 4D model regardless. For a screen it is arguably correct:
+    # the geometry really is static and only the RGB changes. Whether the trainer can
+    # then fit that appearance-only variation on static Gaussians is an open question
+    # (see D1_FUTURE_WORK_PLAN.md). Set SPAG_LOCK_ACTIVITY=0 for a clip where background
+    # depth motion genuinely matters. The alignment fit keeps using fused_mask either way.
+    lock_activity = os.environ.get("SPAG_LOCK_ACTIVITY", "1") != "0"
+
     (output_folder / "gaussians").mkdir(parents=True, exist_ok=True)
     if freeze_bg:
         import json
@@ -942,6 +1052,42 @@ def run_video(
     # off the critical path. max_workers=2 keeps disk I/O bounded.
     ply_executor = ThreadPoolExecutor(max_workers=2)
     ply_futures = []
+
+    # §9 diagnostics pass: CSV writer + per-region "previous frame" medians for
+    # the frame-to-frame depth-delta columns (mirrors the existing bg/fg delta
+    # pattern above, but split by the actual composite alpha bands instead of
+    # the coarser fused_mask).
+    _DIAG_LAT_BINS = 8
+    diag_file = None
+    diag_writer = None
+    diag_prev_region_median = {"static": None, "dynamic": None, "feather": None}
+    if diag_dir is not None:
+        diag_file = open(diag_csv_path, "w", newline="")
+        diag_writer = csv.writer(diag_file)
+        diag_writer.writerow(
+            ["frame", "scale", "shift", "n_static", "resid_median", "resid_p95"]
+            + [f"resid_lat_{i}" for i in range(_DIAG_LAT_BINS)]
+            + ["flow_static_med_dx", "flow_static_med_dy", "flow_static_med_mag"]
+            + ["conf_mean", "conf_frac_zero", "conf_frac_lt_0.5", "age_mean", "age_max"]
+            + ["depth_delta_static", "depth_delta_dynamic", "depth_delta_feather"]
+            + ["per_object_flow_mag"]
+        )
+
+    def _diag_resid_by_latitude(resid_full: np.ndarray, static_mask: np.ndarray) -> list:
+        h = static_mask.shape[0]
+        edges = np.linspace(0, h, _DIAG_LAT_BINS + 1).astype(int)
+        out = []
+        for i in range(_DIAG_LAT_BINS):
+            band_static = static_mask[edges[i]:edges[i + 1]]
+            band_resid = resid_full[edges[i]:edges[i + 1]]
+            vals = band_resid[band_static]
+            out.append(float(np.median(vals)) if vals.size else float("nan"))
+        return out
+
+    def _diag_region_median(depth_np: np.ndarray, region_mask: np.ndarray):
+        vals = depth_np[region_mask]
+        return float(np.median(vals)) if vals.size else None
+
     t_depth_loop0 = time.time()
     # Tier 4.4: prefetch DA360 depth for frame i+1. depth_engine.predict is a
     # GPU op; issuing it before frame i's CPU/host-sync-heavy post-processing
@@ -1002,6 +1148,7 @@ def run_video(
         )
         if alignement_mask == "all":
             fused_mask = np.zeros((W, H), dtype=np.uint8)  # Align on all pixels ; Nothing is considerer moving
+            output = {}  # no SAM output in this mode; keeps §9 diagnostics' per-object loop safe
         else:  # Add SAM masks
             output = outputs_per_frame[idx * skip_step]
             sam_mask = np.zeros((W, H), dtype=np.uint8)
@@ -1011,11 +1158,25 @@ def run_video(
 
         fused_t = torch.from_numpy(fused_mask).to("cuda") if gpu_depth_chain else None
 
+        # Which pixels the bg-lock composite treats as moving (see SPAG_LOCK_ACTIVITY).
+        # sam_mask is always defined here under bglock: run_video() rejects
+        # depth_correction="bglock" unless alignement_mask is "sam"/"sam_and_activity",
+        # both of which take the else-branch above. When alignement_mask="sam" the two
+        # masks are already identical, so the flag is a no-op there.
+        lock_mask = sam_mask if lock_activity else fused_mask
+        lock_t = (
+            fused_t if lock_mask is fused_mask
+            else (torch.from_numpy(lock_mask).to("cuda") if gpu_depth_chain else None)
+        )
+
         # Align depth_ref_np
-        median_depth_fg.append(float(np.median(depth_np[fused_mask > 0])))
+        median_depth_fg.append(float(np.median(
+            depth_np[_valid_metric_mask(depth_np, fused_mask > 0, metrics_outlier_cap)]
+        )))
+        diag_out = {} if diag_writer is not None else None
         if gpu_depth_chain:
             # align + smoothing on the GPU (depth is already a cuda tensor)
-            aligned_t = align_depth_frame_gpu(depth, depth_ref_t, fused_t)
+            aligned_t = align_depth_frame_gpu(depth, depth_ref_t, fused_t, diag_out=diag_out)
             if depth_smoother is not None:
                 aligned_t = depth_smoother.call_torch(aligned_t)
             aligned_depth_np = aligned_t.cpu().numpy()
@@ -1025,18 +1186,21 @@ def run_video(
                 aligned_depth_np = depth_np
             else:
                 aligned_depth_np = align_depth_frame(
-                    depth_np, depth_ref_np, fused_mask, alignement_method, verbose=True
+                    depth_np, depth_ref_np, fused_mask, alignement_method, verbose=True, diag_out=diag_out
                 ).copy()
             # Solution 1: temporal depth smoothing (causal window) on the aligned
             # depth, applied before FG stabilization / bg-locked compositing / GS.
             if depth_smoother is not None:
                 aligned_depth_np = depth_smoother(aligned_depth_np)
-        aligned_median_depth_fg.append(float(np.median(aligned_depth_np[fused_mask > 0])))
+        aligned_median_depth_fg.append(float(np.median(
+            aligned_depth_np[_valid_metric_mask(aligned_depth_np, fused_mask > 0, metrics_outlier_cap)]
+        )))
 
         # Background depth metrics (NEW): median depth of static regions
         bg_pixels = fused_mask == 0
         if bg_pixels.sum() > 0:
-            bg_median = float(np.median(aligned_depth_np[bg_pixels]))
+            bg_valid = _valid_metric_mask(aligned_depth_np, bg_pixels, metrics_outlier_cap)
+            bg_median = float(np.median(aligned_depth_np[bg_valid]))
             aligned_median_depth_bg.append(bg_median)
             # Frame-to-frame delta (spike detection)
             if len(aligned_median_depth_bg) > 1:
@@ -1077,7 +1241,7 @@ def run_video(
                     flow_state,
                     fb_err_threshold=fb_err_threshold,
                     pole_margin_frac=pole_margin_frac,
-                    disocclusion_mask=fused_t,
+                    disocclusion_mask=lock_t,
                 )
                 depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
             else:
@@ -1090,30 +1254,111 @@ def run_video(
                     flow_state,
                     fb_err_threshold=fb_err_threshold,
                     pole_margin_frac=pole_margin_frac,
-                    disocclusion_mask=fused_mask,
+                    disocclusion_mask=lock_mask,
                 )
+            composite_alpha = None  # (H,W) soft object weight, only needed for §9 diagnostics
             if gpu_composite:
-                aligned_depth_np2_t, _ = composite_bg_locked_torch(
-                    depth_object_t, depth_ref_t, fused_t,
+                aligned_depth_np2_t, alpha_t = composite_bg_locked_torch(
+                    depth_object_t, depth_ref_t, lock_t,
                     dilate_px=bg_lock_dilate_px, feather_px=bg_lock_feather_px,
+                    hard_depth_cutover=hard_depth_cutover,
                 )
                 depth_prev_t = aligned_depth_np2_t
                 aligned_depth_np2 = aligned_depth_np2_t.cpu().numpy()
+                if diag_writer is not None:
+                    composite_alpha = alpha_t.float().cpu().numpy()
             else:
-                aligned_depth_np2, _ = composite_bg_locked(
-                    depth_object, depth_ref_np, fused_mask,
+                aligned_depth_np2, alpha = composite_bg_locked(
+                    depth_object, depth_ref_np, lock_mask,
                     dilate_px=bg_lock_dilate_px, feather_px=bg_lock_feather_px,
+                    hard_depth_cutover=hard_depth_cutover,
                 )
+                if diag_writer is not None:
+                    composite_alpha = alpha
                 if gpu_depth_chain:
                     depth_prev_t = torch.from_numpy(aligned_depth_np2).to("cuda")
             depth_prev_final = aligned_depth_np2
         else:
             aligned_depth_np2 = fg_stabilizer(aligned_depth_np, fused_mask).copy()
+            composite_alpha = None
         stabilized_aligned_median_depth_fg.append(
-            float(np.median(aligned_depth_np2[fused_mask > 0]))
+            float(np.median(
+                aligned_depth_np2[_valid_metric_mask(aligned_depth_np2, fused_mask > 0, metrics_outlier_cap)]
+            ))
         )
 
         aligned_depth_list_cpu.append(aligned_depth_np2)
+
+        if diag_writer is not None:
+            resid_median = diag_out.get("resid_median", float("nan"))
+            resid_p95 = diag_out.get("resid_p95", float("nan"))
+            scale = diag_out.get("scale", float("nan"))
+            shift = diag_out.get("shift", float("nan"))
+            n_static = diag_out.get("n_static", 0)
+            if "resid_full" in diag_out:
+                lat_resid = _diag_resid_by_latitude(diag_out["resid_full"], diag_out["static_mask"])
+            else:
+                lat_resid = [float("nan")] * _DIAG_LAT_BINS
+
+            # (e) median flow vector over static pixels -- reuses §11's
+            # check_camera_static.py logic (median over the composite's own
+            # static definition, lock_mask==0).
+            if idx >= 1 and (idx - 1) < len(flows_fwd):
+                flow_static = flows_fwd[idx - 1][lock_mask == 0]
+                flow_med_dx = float(np.median(flow_static[:, 0])) if flow_static.size else float("nan")
+                flow_med_dy = float(np.median(flow_static[:, 1])) if flow_static.size else float("nan")
+                flow_med_mag = float(np.median(np.hypot(flow_static[:, 0], flow_static[:, 1]))) if flow_static.size else float("nan")
+            else:
+                flow_med_dx = flow_med_dy = flow_med_mag = float("nan")
+
+            # (d) running_confidence histogram -- reuses flow_state.trace, already
+            # populated above (enabled whenever SPAG_CONF_HIST or SPAG_DIAG_CSV is set).
+            if flow_state.trace:
+                conf_stats = flow_state.trace[-1]
+            else:
+                conf_stats = {}
+            conf_mean = conf_stats.get("mean", float("nan"))
+            conf_frac_zero = conf_stats.get("frac_zero", float("nan"))
+            conf_frac_lt_half = conf_stats.get("frac_lt_0.5", float("nan"))
+            age_mean = conf_stats.get("age_mean", float("nan"))
+            age_max = conf_stats.get("age_max", float("nan"))
+
+            # (h) depth variance split static/dynamic/feather, as frame-to-frame
+            # median delta per region (same pattern as the existing bg/fg deltas
+            # above, but keyed on the real composite alpha instead of fused_mask).
+            deltas = {}
+            if composite_alpha is not None:
+                region_masks = {
+                    "static": composite_alpha <= 0.02,
+                    "dynamic": composite_alpha >= 0.98,
+                    "feather": (composite_alpha > 0.02) & (composite_alpha < 0.98),
+                }
+                for name, rmask in region_masks.items():
+                    med = _diag_region_median(aligned_depth_np2, rmask)
+                    prev = diag_prev_region_median[name]
+                    deltas[name] = abs(med - prev) if (med is not None and prev is not None) else float("nan")
+                    diag_prev_region_median[name] = med
+            else:
+                deltas = {"static": float("nan"), "dynamic": float("nan"), "feather": float("nan")}
+
+            # (f) per-object mean in-mask flow magnitude.
+            obj_flow_strs = []
+            if idx >= 1 and (idx - 1) < len(flows_fwd):
+                flow_mag_full = np.hypot(flows_fwd[idx - 1][..., 0], flows_fwd[idx - 1][..., 1])
+                for obj_id, obj_mask in output.items():
+                    m = obj_mask.astype(bool)
+                    if m.any():
+                        obj_flow_strs.append(f"{obj_id}:{float(flow_mag_full[m].mean()):.3f}")
+            per_object_flow_mag = ";".join(obj_flow_strs)
+
+            diag_writer.writerow(
+                [idx, scale, shift, n_static, resid_median, resid_p95]
+                + lat_resid
+                + [flow_med_dx, flow_med_dy, flow_med_mag]
+                + [conf_mean, conf_frac_zero, conf_frac_lt_half, age_mean, age_max]
+                + [deltas["static"], deltas["dynamic"], deltas["feather"]]
+                + [per_object_flow_mag]
+            )
 
         depth_alignement_cumtime += time.time() - start_depth
 
@@ -1171,10 +1416,18 @@ def run_video(
     for f in ply_futures:
         f.result()
     ply_executor.shutdown(wait=True)
+    if diag_file is not None:
+        diag_file.close()
+        print(f"[SPAG4D] §9 diagnostics CSV written: {diag_csv_path}")
     step_times["depth_loop_total"] = time.time() - t_depth_loop0
     step_times["depth_loop_estimation"] = depth_estimation_cumtime
     step_times["depth_loop_alignment"] = depth_alignement_cumtime
     step_times["depth_loop_gs_generation"] = gs_generation_cumtime
+
+    if conf_hist_path and flow_state.trace:
+        import json as _json
+        Path(conf_hist_path).write_text(_json.dumps(flow_state.trace, indent=1))
+        print(f"[SPAG4D] confidence trace ({len(flow_state.trace)} frames) -> {conf_hist_path}")
 
     plt.figure(figsize=(12, 5))
     plt.plot(median_depth_fg, marker="o", label="Original", color="orange")
@@ -1324,6 +1577,31 @@ def run_video(
     )
 
 
+# §4.3 (benchmarks/T1_T2_P0_AUDIT.md): DA360 disparity near zero inverts to ~1e6
+# (sky/poles), and PaGeR clamps to exactly 200.0 — both pass depth>0 & isfinite, so
+# without this they silently enter the affine fit and pull scale/shift toward
+# nonsense. Neither backend declares a proper validity mask (§10.1), so this is a
+# generic magnitude gate: real scene depth is never 50x the plate's own median.
+_FIT_OUTLIER_RATIO = 50.0
+
+
+def _fit_outlier_cap(depth_ref: np.ndarray) -> float:
+    finite_ref = depth_ref[np.isfinite(depth_ref) & (depth_ref > 0)]
+    if finite_ref.size == 0:
+        return float("inf")
+    ref_median = float(np.median(finite_ref))
+    return ref_median * _FIT_OUTLIER_RATIO if ref_median > 0 else float("inf")
+
+
+def _valid_metric_mask(depth: np.ndarray, base_mask: np.ndarray, cap: float) -> np.ndarray:
+    """`base_mask` narrowed to pixels a per-frame median metric can trust: finite,
+    positive, under the §4.3 outlier cap. Falls back to `base_mask` unfiltered if the
+    gate would empty the selection (e.g. a region that is genuinely all sky/outlier),
+    since np.median on an empty array raises."""
+    gated = base_mask & np.isfinite(depth) & (depth > 0) & (depth < cap)
+    return gated if gated.any() else base_mask
+
+
 def align_depth_frame(
     depth_frame: np.ndarray,
     depth_ref: np.ndarray,
@@ -1334,6 +1612,7 @@ def align_depth_frame(
     ransac_residual_threshold: float = 0.1,  # en unités de profondeur relative
     ransac_max_trials: int = 100,
     verbose: bool = False,
+    diag_out: "dict | None" = None,
 ) -> np.ndarray:
     """
     Aligne depth_frame sur depth_ref en estimant scale s et shift t
@@ -1363,12 +1642,15 @@ def align_depth_frame(
     """
 
     # ── 1. Masque statique ───────────────────────────────────────────────────
+    outlier_cap = _fit_outlier_cap(depth_ref)
     static_mask = (
         (mask_moving == 0)
         & (depth_frame > 0)
         & (depth_ref > 0)
         & np.isfinite(depth_frame)
         & np.isfinite(depth_ref)
+        & (depth_frame < outlier_cap)  # §4.3: excludes backend outliers from the fit
+        & (depth_ref < outlier_cap)
     )
 
     n_static = np.sum(static_mask)
@@ -1428,6 +1710,20 @@ def align_depth_frame(
             f"p95={np.percentile(residuals, 95):.4f}"
         )
 
+    if diag_out is not None:
+        # §9 diagnostics pass (SPAG_DIAG_CSV): fitted scale/shift + residual on
+        # the static set the fit itself used, plus a full-frame residual map
+        # (evaluated everywhere, not just on static_mask) so the caller can bin
+        # it by latitude without redoing the fit.
+        residuals = np.abs(y - (s * x + t))
+        diag_out["scale"] = float(s)
+        diag_out["shift"] = float(t)
+        diag_out["n_static"] = int(n_static)
+        diag_out["resid_median"] = float(np.median(residuals)) if residuals.size else float("nan")
+        diag_out["resid_p95"] = float(np.percentile(residuals, 95)) if residuals.size else float("nan")
+        diag_out["resid_full"] = np.abs(depth_ref - (s * depth_frame + t))
+        diag_out["static_mask"] = static_mask
+
     # ── 6. Application hors mask statique───────────────────────────────────
     depth_frame[~static_mask] = s * depth_frame[~static_mask] + t
 
@@ -1440,6 +1736,7 @@ def align_depth_frame_gpu(
     mask_moving: torch.Tensor,
     min_static_pixels: int = 100,
     scale_clip: tuple = (0.5, 2.0),
+    diag_out: "dict | None" = None,
 ) -> torch.Tensor:
     """GPU/torch equivalent of align_depth_frame(method="lstsq").
 
@@ -1448,12 +1745,20 @@ def align_depth_frame_gpu(
     exactly like the numpy path. Not byte-identical to it (GPU reduction order),
     but within float rounding. All tensors are (H,W) cuda; returns a new (H,W).
     """
+    finite_ref = depth_ref[torch.isfinite(depth_ref) & (depth_ref > 0)]
+    if finite_ref.numel() > 0:
+        ref_median = float(torch.median(finite_ref))
+        outlier_cap = ref_median * _FIT_OUTLIER_RATIO if ref_median > 0 else float("inf")
+    else:
+        outlier_cap = float("inf")
     static = (
         (mask_moving == 0)
         & (depth_frame > 0)
         & (depth_ref > 0)
         & torch.isfinite(depth_frame)
         & torch.isfinite(depth_ref)
+        & (depth_frame < outlier_cap)  # §4.3: excludes backend outliers from the fit
+        & (depth_ref < outlier_cap)
     )
     n_static = int(static.sum().item())
     if n_static < min_static_pixels:
@@ -1485,6 +1790,17 @@ def align_depth_frame_gpu(
     if s_clipped != s:
         t = float(torch.median(y)) - s_clipped * float(torch.median(x))
     s = s_clipped
+
+    if diag_out is not None:
+        # §9 diagnostics pass (SPAG_DIAG_CSV): mirrors align_depth_frame's diag_out.
+        resid = (y - (s * x + t)).abs()
+        diag_out["scale"] = float(s)
+        diag_out["shift"] = float(t)
+        diag_out["n_static"] = n_static
+        diag_out["resid_median"] = float(resid.median()) if resid.numel() else float("nan")
+        diag_out["resid_p95"] = float(torch.quantile(resid, 0.95)) if resid.numel() else float("nan")
+        diag_out["resid_full"] = (depth_ref - (s * depth_frame + t)).abs().cpu().numpy()
+        diag_out["static_mask"] = static.cpu().numpy()
 
     out = depth_frame.clone()
     nm = ~static
@@ -1621,11 +1937,40 @@ def segment_with_flows(
     # crash). Re-decode the native video directly instead: one decode pass,
     # exact native frame count, no re-encode/re-decode round trip like the
     # old mp4-proxy attempt.
-    sam3_scale = float(os.environ.get("SPAG_SAM3_SCALE", "1.0"))
+    sam3_scale = float(os.environ.get("SPAG_SAM3_SCALE_DISABLE", "0.5"))
+    sam3_maxsize = int(os.environ.get("SPAG_SAM3_MAXSIZE", "1536"))
+    if sam3_maxsize > 0:
+        # Absolute cap on the longer edge instead of a relative scale factor:
+        # clips already below the cap (e.g. MattSwift at 2048px) pass through
+        # near-native, so thin/articulated subjects don't lose detail they
+        # didn't need to; only clips above the cap (e.g. CIELE at 3840px) get
+        # downscaled, and by more than a flat 0.5 would -- see B1 doc item 3
+        # for the mask-IoU evidence this targets (SPAG_SAM3_SCALE=0.5 hurt
+        # MattSwift/atelier_1 but not Dispo_RDV/scene01, no resolution
+        # correlation -- but MattSwift's post-scale resolution was the
+        # lowest of the four, hence the maxsize alternative).
+        # NOTE: must use meta['H']/meta['W'] (true native), not this function's
+        # `viz_frames` param -- that's actually the WAFT-scaled array (already
+        # capped to ~1024 on the long side by the caller), so every clip lands
+        # near the same WAFT cap regardless of native resolution. Using it here
+        # would make SPAG_SAM3_SCALE and SPAG_SAM3_MAXSIZE both anchor off a
+        # pre-shrunk shape -- confirmed empirically: SPAG_SAM3_SCALE=0.5 logs
+        # "downscaled to 512x256" for every one of MattSwift/atelier_1/scene01/
+        # Dispo_RDV despite native resolutions ranging 2048px-2560px, because
+        # the 0.5 factor is applied to the ~1024px WAFT shape, not native --
+        # the real native-to-SAM3 factor was 0.2-0.25x, not 0.5x.
+        native_long_edge = max(meta['H'], meta['W'])
+        sam3_scale = min(1.0, sam3_maxsize / native_long_edge)
     sam3_resource_path = str(video_path)
     if sam3_scale < 1.0:
-        sW = max(int(viz_frames.shape[2] * sam3_scale) & ~1, 2)
-        sH = max(int(viz_frames.shape[1] * sam3_scale) & ~1, 2)
+        # Apply the factor to NATIVE dims, for the same reason the note above
+        # derives it from native: the frames being resized are decoded at native
+        # resolution below, and viz_frames is the WAFT-shrunk array (~1024 long
+        # side). Scaling viz_frames here would compose the two shrinks --
+        # effective res = viz_long * (maxsize / native_long), so a 3840px clip
+        # asking for 1536 actually got 408px.
+        sW = max(int(meta['W'] * sam3_scale) & ~1, 2)
+        sH = max(int(meta['H'] * sam3_scale) & ~1, 2)
         cap = cv2.VideoCapture(str(video_path))
         sam3_resource_path = []
         while True:
@@ -1637,7 +1982,8 @@ def segment_with_flows(
                 Image.fromarray(cv2.resize(frame_rgb, (sW, sH), interpolation=cv2.INTER_AREA))
             )
         cap.release()
-        print(f"[SPAG4D] SAM3 segmentation pass downscaled to {sW}x{sH} (SPAG_SAM3_SCALE={sam3_scale}), {len(sam3_resource_path)} in-memory native-frame-count frames...")
+        _scale_src = f"SPAG_SAM3_MAXSIZE={sam3_maxsize}" if sam3_maxsize > 0 else f"SPAG_SAM3_SCALE={sam3_scale}"
+        print(f"[SPAG4D] SAM3 segmentation pass downscaled to {sW}x{sH} ({_scale_src}, effective scale={sam3_scale:.3f}), {len(sam3_resource_path)} in-memory native-frame-count frames...")
 
     # Start a session
     initial_response = video_predictor.handle_request(
@@ -2045,8 +2391,12 @@ def segment_with_flows(
     # STEP B: Propagate All Interleaved Multi-Object Tracks
     print(f"\n--- Propagating {found_object} moving object starting at {start_frame_index} ---")
 
-    mask_writer = cv2.VideoWriter(str(output_path / 'motion_detection_preview.mp4'), fourcc, meta['fps'], (meta['new_W'], meta['new_H']))
-    mask_sep_writer = cv2.VideoWriter(str(output_path / 'sam3_output_masks.mp4'), fourcc, meta['fps'], (meta['new_W'], meta['new_H']))
+    # Combined preview: motion-detection mask (left) and per-object SAM3 masks
+    # with ID boxes (right), concatenated into one video instead of two separate files.
+    mask_writer = cv2.VideoWriter(
+        str(output_path / 'sam3_masks_preview.mp4'), fourcc, meta['fps'],
+        (meta['new_W'], meta['new_H'] * 2),
+    )
     np.random.seed(42)  # Pour garder les mêmes couleurs d'une frame à l'autre
     STATIC_COLORS = np.random.randint(0, 255, size=(found_object, 3), dtype=np.uint8)
     color_map = {
@@ -2126,9 +2476,11 @@ def segment_with_flows(
             h_pixel = int(boxes_xyhw[3] * meta['new_H'])
             cv2.rectangle(separated_mask, (x_pixel, y_pixel), (x_pixel + w_pixel, y_pixel + h_pixel), color, 2)
             cv2.putText(separated_mask, f"ID:{obj_id}", (x_pixel, y_pixel - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        # Save combined black-and-white mask frame
-        mask_writer.write(np.stack([accumulated_mask] * 3, axis=-1))
-        mask_sep_writer.write(separated_mask)
+        # Save combined black-and-white mask + per-object mask side-by-side
+        combined_frame = np.concatenate(
+            [np.stack([accumulated_mask] * 3, axis=-1), separated_mask], axis=0
+        )
+        mask_writer.write(combined_frame)
         return frame_idx
 
     # Tier 4.2 (opt-in, SPAG_SAM3_MAX_FRAMES=<int>): bound per-call VRAM/memory-bank
@@ -2260,11 +2612,9 @@ def segment_with_flows(
         )
         video_predictor.shutdown()
 
-        # Close writers
+        # Close writer
         mask_writer.release()
-        mask_sep_writer.release()
-        reencode_h264(str(output_path / 'motion_detection_preview.mp4'))
-        reencode_h264(str(output_path / 'sam3_output_masks.mp4'))
+        reencode_h264(str(output_path / 'sam3_masks_preview.mp4'))
 
     # Opt-in per-object mask-persistence dump (SPAG_OCCL_MASKDUMP=<path.json>):
     # records, per tracked obj_id, the non-empty-mask coverage fraction over the

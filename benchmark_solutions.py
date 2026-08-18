@@ -32,10 +32,10 @@ DEFAULT_VIDEO_DIR = "/raid/mb273924/_DATASETS/uptale/data/videos"
 
 # Fixed pipeline config shared by every run (the recommended baseline setup).
 BASE_KWARGS = dict(
-    skip_step=2,
-    stride=4,
+    skip_step=4,
+    stride=8,
     temporal_consistency=False,
-    freeze_bg=True,
+    freeze_bg=False,
     outlier_pruning=0.3,
     grazing_angle=85.0,
     sparse_pruning=0.1,
@@ -57,17 +57,7 @@ CONFIGS = {
     # "sol1_gaussian_w5": dict(depth_correction="affine", depth_smoothing=True,
     #                          depth_smoothing_window=5, depth_smoothing_method="gaussian"),
     "bglock_sol1_median_w5": dict(depth_correction="bglock", depth_smoothing=True,
-                           depth_smoothing_window=5, depth_smoothing_method="median"),
-    # "sol1_median_sol4": dict(depth_correction="affine", depth_smoothing=True,
-    #                        depth_smoothing_window=5, depth_smoothing_method="median",
-    #                        reference_frames_for_median=7),
-    # # Solution 4: multi-frame depth reference
-    # "sol4_ref7": dict(depth_correction="affine", reference_frames_for_median=7),
-    # "bglock_sol4_ref7": dict(depth_correction="bglock", reference_frames_for_median=7),
-    # # Solution 6: FG stabilizer tuning (baseline is buffer=21, jump=0.5)
-    # "sol6_b5_j0.2": dict(depth_correction="affine", fg_buffer_size=5, fg_jump_threshold=0.2),
-    # "sol6_b11_j0.5": dict(depth_correction="affine", fg_buffer_size=11, fg_jump_threshold=0.5),
-    # "sol6_b15_j1.0": dict(depth_correction="affine", fg_buffer_size=15, fg_jump_threshold=1.0),
+                           depth_smoothing_window=5, depth_smoothing_method="median")
 }
 
 

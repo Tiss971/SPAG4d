@@ -230,6 +230,7 @@ def composite_bg_locked(
     dynamic_mask: np.ndarray,
     dilate_px: int = 12,
     feather_px: int = 9,
+    hard_depth_cutover: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fixed-camera depth compositing.
 
@@ -244,6 +245,18 @@ def composite_bg_locked(
     inside the feathered dynamic mask, where the scene genuinely changes.
 
     Returns (depth_final, alpha) where alpha is the soft object weight in [0,1].
+
+    `hard_depth_cutover` (§8, bglock_open_questions.md): a plain linear blend
+    of `object_depth` and `depth_ref` inside the feather band produces *depth*
+    values that are a linear interpolation between foreground and background
+    surfaces — a physically-nonexistent "phantom slab" hovering in mid-air at
+    a discontinuity (e.g. person in front of a wall), which splats into a
+    visible smear of floating points. When True, `alpha` is still returned
+    soft (for callers that want a soft opacity/weight), but the *depth value*
+    itself is selected by nearest source (alpha>=0.5 -> object_depth, else
+    depth_ref) rather than interpolated, so no invented mid-air depth is ever
+    written. Opt-in / default off: changes production point-cloud geometry at
+    every dynamic-object edge, not benchmarked against the shipped default yet.
     """
     alpha = feather_dynamic_mask(dynamic_mask, dilate_px, feather_px)
     # Where depth_ref is NaN ("ignore" mode), fall back entirely to object_depth.
@@ -252,17 +265,72 @@ def composite_bg_locked(
     ref_undefined = np.isnan(depth_ref)
     safe_alpha = np.where(ref_undefined, 1.0, alpha)
     safe_ref = np.where(ref_undefined, 0.0, depth_ref)
-    depth_final = safe_alpha * object_depth + (1.0 - safe_alpha) * safe_ref
+    if hard_depth_cutover:
+        depth_final = np.where(safe_alpha >= 0.5, object_depth, safe_ref)
+    else:
+        depth_final = safe_alpha * object_depth + (1.0 - safe_alpha) * safe_ref
     return np.clip(depth_final, 0.0, None), alpha
 
 
 @dataclass
 class PropagationState:
     """Carries the per-pixel confidence decay across frames so radial motion
-    (invisible to flow) gets continuously re-anchored to monocular depth."""
+    (invisible to flow) gets continuously re-anchored to monocular depth.
 
-    confidence: np.ndarray | None = None  # (H, W) in [0, 1], None before first frame
+    State is an *age* field — frames elapsed since a pixel was last re-anchored
+    to the fresh monocular estimate — rather than a raw confidence. Confidence
+    is then `decay ** age`, floored at `conf_floor`. Two reasons (see
+    docs/T1_T2_P0_AUDIT.md §4.1/§4.2):
+
+      - Age makes the decay actually compound. The previous scheme stored a
+        confidence that was reset to 1.0 on every trusted frame, so
+        `min(frame_conf, prev * decay)` could only ever take the values
+        {0.0, 0.85}: `decay` was a fixed blend weight, not a decay, and the
+        advertised "radial drift is continuously re-anchored" never happened.
+      - Age is a property of a *surface point*, so it is warped along the flow
+        with the depth it belongs to (§4.2), instead of being read at the
+        stale grid position.
+
+    `conf_floor` stops the exponential from running to zero (which would
+    disable propagation entirely after a few dozen frames and bring back the
+    foreground flicker bglock exists to remove). Steady state is a first-order
+    low-pass: each frame mixes `1 - conf_floor` of fresh monocular depth in, so
+    accumulated radial drift is bounded by a geometric series instead of
+    growing without limit — and it does so smoothly, with no periodic
+    full-re-anchor pop.
+    """
+
+    confidence: np.ndarray | None = None  # (H, W) last frame's running_confidence (diagnostic; input only in legacy mode)
+    age: np.ndarray | None = None  # (H, W) frames since last re-anchor, warped along the flow
     decay: float = 0.85  # confidence multiplier per consecutive propagation step
+    conf_floor: float = 0.5  # confidence never decays below this (see above)
+    legacy: bool = False  # SPAG_CONF_LEGACY=1: pre-2026-08-17 non-compounding behaviour
+    trace: list | None = None  # opt-in per-frame running_confidence stats (SPAG_CONF_HIST)
+
+    def age_cap(self) -> float:
+        """Age beyond which `decay ** age` is already below `conf_floor`, so the
+        value is saturated. Clamping there keeps the field finite and inspectable."""
+        if self.conf_floor <= 0.0 or not (0.0 < self.decay < 1.0):
+            return 1e4
+        return float(np.ceil(np.log(self.conf_floor) / np.log(self.decay))) + 1.0
+
+
+def _conf_stats(rc, age) -> dict:
+    """Per-frame running_confidence / age summary for SPAG_CONF_HIST. Works on
+    numpy arrays (cpu path) and cuda tensors (gpu path) alike."""
+    is_t = isinstance(rc, torch.Tensor)
+    uniq = torch.unique(rc) if is_t else np.unique(rc)
+    stats = {
+        "frac_zero": float((rc == 0).mean() if not is_t else (rc == 0).float().mean()),
+        "frac_lt_0.5": float((rc < 0.5).mean() if not is_t else (rc < 0.5).float().mean()),
+        "mean": float(rc.mean()),
+        "n_distinct": int(uniq.numel() if is_t else uniq.size),
+        "distinct": sorted(float(v) for v in (uniq.tolist() if is_t else uniq.ravel().tolist()))[:8],
+    }
+    if age is not None:
+        stats["age_mean"] = float(age.mean())
+        stats["age_max"] = float(age.max())
+    return stats
 
 
 def propagate_depth_via_flow(
@@ -291,11 +359,17 @@ def propagate_depth_via_flow(
     """
     H, W = depth_curr_affine.shape
 
-    # depth propagation and the two FB-consistency warps all backward-warp along
-    # the SAME flow_fwd, so batch them into one grid_sample (identical result).
-    depth_propagated, warped_bwd_x, warped_bwd_y = warp_backward_multi(
-        [depth_prev_final, flow_bwd[..., 0], flow_bwd[..., 1]], flow_fwd
-    )
+    # depth propagation, the two FB-consistency warps and the age field all
+    # backward-warp along the SAME flow_fwd, so batch them into one grid_sample
+    # (identical result). Age rides along at no extra grid_sample: it describes
+    # the surface point, so it must be sampled at p - flow(p) like the depth.
+    to_warp = [depth_prev_final, flow_bwd[..., 0], flow_bwd[..., 1]]
+    warp_age = state.age is not None and not state.legacy
+    if warp_age:
+        to_warp.append(state.age)
+    warped = warp_backward_multi(to_warp, flow_fwd)
+    depth_propagated, warped_bwd_x, warped_bwd_y = warped[0], warped[1], warped[2]
+    age_prev = warped[3] if warp_age else None
     err_x = flow_fwd[..., 0] + warped_bwd_x
     err_y = flow_fwd[..., 1] + warped_bwd_y
     fb_err = np.sqrt(err_x**2 + err_y**2)
@@ -304,10 +378,22 @@ def propagate_depth_via_flow(
 
     frame_confidence = fb_trust * pole_trust
 
-    if state.confidence is None:
-        running_confidence = frame_confidence
+    age = None
+    if state.legacy:
+        if state.confidence is None:
+            running_confidence = frame_confidence
+        else:
+            running_confidence = np.minimum(frame_confidence, state.confidence * state.decay)
     else:
-        running_confidence = np.minimum(frame_confidence, state.confidence * state.decay)
+        # Age since last re-anchor: +1 wherever we keep propagating, reset to 0
+        # wherever this frame's flow is untrusted (that pixel takes the fresh
+        # monocular estimate / D_ref below, i.e. it *is* re-anchored).
+        prev = 0.0 if age_prev is None else age_prev
+        age = np.where(frame_confidence > 0, prev + 1.0, 0.0).astype(np.float32)
+        age = np.clip(age, 0.0, state.age_cap())
+        running_confidence = frame_confidence * np.maximum(
+            state.conf_floor, state.decay**age
+        ).astype(np.float32)
 
     # Disocclusion: pixels flagged unreliable by FB-consistency that are NOT
     # inside the (previous) dynamic-object mask are revealed static
@@ -316,20 +402,30 @@ def propagate_depth_via_flow(
         running_confidence * depth_propagated + (1.0 - running_confidence) * depth_curr_affine
     )
     if disocclusion_mask is not None:
-        reveal = (running_confidence < 0.5) & (disocclusion_mask == 0)
+        # Gate on frame_confidence, not on `running_confidence < 0.5`: the latter
+        # was only ever equivalent to "== 0" and now depends on conf_floor, which
+        # is a tuning knob and must not silently move the reveal set.
+        reveal = (frame_confidence == 0) & (disocclusion_mask == 0)
         depth_final = np.where(reveal, depth_ref, depth_final)
 
     depth_final = np.clip(depth_final, 0.0, None)
 
-    # Confidence carried forward resets to 1.0 wherever we just trusted a
-    # fresh propagation, decays otherwise -- re-anchors radial-motion drift.
-    state.confidence = np.where(frame_confidence > 0, 1.0, running_confidence)
+    if state.trace is not None:
+        state.trace.append(_conf_stats(running_confidence, age))
+    state.age = age
+    # Legacy input path; otherwise kept purely as a diagnostic of the last frame.
+    state.confidence = (
+        np.where(frame_confidence > 0, 1.0, running_confidence)
+        if state.legacy
+        else running_confidence
+    )
 
     debug = {
         "fb_err": fb_err,
         "fb_trust": fb_trust,
         "pole_trust": pole_trust,
         "confidence": running_confidence,
+        "age": age,
         "depth_propagated": depth_propagated,
     }
     return depth_final, running_confidence, debug
@@ -415,8 +511,13 @@ def propagate_depth_via_flow_torch(
     (H,W) float32 cuda (flows (H,W,2), disocclusion_mask (H,W) any numeric).
     Returns depth_final (H,W); state.confidence carries forward as a tensor."""
     H, W = depth_curr_affine.shape
-    stacked = torch.stack([depth_prev_final, flow_bwd[..., 0], flow_bwd[..., 1]], dim=0)
-    warped = warp_backward_multi_torch(stacked, flow_fwd)
+    # Age rides along in the same batched warp as the depth (§4.2: it describes a
+    # surface point, so it must be sampled at p - flow(p)), at no extra grid_sample.
+    warp_age = state.age is not None and not state.legacy
+    to_warp = [depth_prev_final, flow_bwd[..., 0], flow_bwd[..., 1]]
+    if warp_age:
+        to_warp.append(state.age)
+    warped = warp_backward_multi_torch(torch.stack(to_warp, dim=0), flow_fwd)
     depth_propagated = warped[0]
     err_x = flow_fwd[..., 0] + warped[1]
     err_y = flow_fwd[..., 1] + warped[2]
@@ -425,21 +526,38 @@ def propagate_depth_via_flow_torch(
     pole_trust = _pole_trust_mask_torch(H, W, pole_margin_frac, depth_curr_affine.device)
     frame_confidence = fb_trust * pole_trust
 
-    if state.confidence is None:
-        running_confidence = frame_confidence
+    age = None
+    if state.legacy:
+        if state.confidence is None:
+            running_confidence = frame_confidence
+        else:
+            running_confidence = torch.minimum(frame_confidence, state.confidence * state.decay)
     else:
-        running_confidence = torch.minimum(frame_confidence, state.confidence * state.decay)
+        prev = warped[3] if warp_age else torch.zeros_like(frame_confidence)
+        age = torch.where(
+            frame_confidence > 0, prev + 1.0, torch.zeros_like(prev)
+        ).clamp_(0.0, state.age_cap())
+        running_confidence = frame_confidence * torch.clamp_min(
+            torch.pow(torch.as_tensor(state.decay, device=age.device), age), state.conf_floor
+        )
 
     depth_final = (
         running_confidence * depth_propagated + (1.0 - running_confidence) * depth_curr_affine
     )
     if disocclusion_mask is not None:
-        reveal = (running_confidence < 0.5) & (disocclusion_mask == 0)
+        # Gate on frame_confidence, not `running_confidence < 0.5` -- see the
+        # numpy twin for why the old threshold carried no information.
+        reveal = (frame_confidence == 0) & (disocclusion_mask == 0)
         depth_final = torch.where(reveal, depth_ref, depth_final)
 
     depth_final = depth_final.clamp_min(0.0)
-    state.confidence = torch.where(
-        frame_confidence > 0, torch.ones_like(running_confidence), running_confidence
+    if state.trace is not None:
+        state.trace.append(_conf_stats(running_confidence, age))
+    state.age = age
+    state.confidence = (
+        torch.where(frame_confidence > 0, torch.ones_like(running_confidence), running_confidence)
+        if state.legacy
+        else running_confidence
     )
     return depth_final
 
@@ -500,12 +618,17 @@ def composite_bg_locked_torch(
     dynamic_mask: torch.Tensor,
     dilate_px: int = 12,
     feather_px: int = 9,
+    hard_depth_cutover: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPU equivalent of composite_bg_locked. depth_ref may contain NaN
-    ("ignore" mode) -> fall back to object_depth there."""
+    ("ignore" mode) -> fall back to object_depth there. See composite_bg_locked's
+    docstring for what hard_depth_cutover does (§8, bglock_open_questions.md)."""
     alpha = feather_dynamic_mask_torch(dynamic_mask, dilate_px, feather_px)
     ref_undefined = torch.isnan(depth_ref)
     safe_alpha = torch.where(ref_undefined, torch.ones_like(alpha), alpha)
     safe_ref = torch.where(ref_undefined, torch.zeros_like(depth_ref), depth_ref)
-    depth_final = safe_alpha * object_depth + (1.0 - safe_alpha) * safe_ref
+    if hard_depth_cutover:
+        depth_final = torch.where(safe_alpha >= 0.5, object_depth, safe_ref)
+    else:
+        depth_final = safe_alpha * object_depth + (1.0 - safe_alpha) * safe_ref
     return depth_final.clamp_min(0.0), alpha

@@ -13,7 +13,7 @@ en distinguant fond statique (doit être parfaitement stable) et objets mobiles
 |---|---|---|---|
 | 2026-07-09 | **B1 — mode `temporal_consistency`** : désactive le rescale par médiane par frame dans DA360/PaGeR ; calcule `scale_factor_to_5m` une seule fois sur la frame de référence, réutilisé pour toutes les frames ([B1_temporal_consistency_fix.md](B1_temporal_consistency_fix.md)) | ✅ mergé (`temporal_consistency=True`) | Corrige la source primaire de dérive d'échelle |
 | 2026-07-09 | **C.1 — scene defaults fixes** : `depth_min/max/sky_thr` calculés une seule fois sur `depth_ref` au lieu d'être recalculés par frame | ✅ mergé | Supprime une source secondaire de scintillement (seuils de filtrage Gaussien stables) |
-| 2026-07-09 | **Propagation de profondeur par flow** (prototype, [flow_depth_propagation_investigation.md](flow_depth_propagation_investigation.md)) : warp la depth stabilisée de t-1 vers t via le flow WAFT dense, au lieu de ré-estimer + recaler affine chaque frame. Blend pondéré par une confiance qui décroît (`decay=0.85`) pour éviter la dérive sur mouvement radial. Gère les pièges spécifiques ERP fixe : couture horizontale (padding circulaire), singularité aux pôles (bande de méfiance 8%), disocclusion = fond déjà connu (`D_ref` réutilisé directement) | ✅ validé sur vidéo réelle, puis mergé (`spag4d/flow_depth_propagation.py`) | Gain ~11-29% sur l'écart-type temporel ; élimine les décrochages catastrophiques ponctuels de l'affine sur `MattSwift_03.mp4` (sujet mobile réel) |
+| 2026-07-09 | **Propagation de profondeur par flow** (prototype, mergé dans `spag4d/flow_depth_propagation.py`) : warp la depth stabilisée de t-1 vers t via le flow WAFT dense, au lieu de ré-estimer + recaler affine chaque frame. Blend pondéré par une confiance qui décroît (`decay=0.85`) pour éviter la dérive sur mouvement radial. Gère les pièges spécifiques ERP fixe : couture horizontale (padding circulaire), singularité aux pôles (bande de méfiance 8%), disocclusion = fond déjà connu (`D_ref` réutilisé directement) | ✅ validé sur vidéo réelle, puis mergé (`spag4d/flow_depth_propagation.py`) | Gain ~11-29% sur l'écart-type temporel ; élimine les décrochages catastrophiques ponctuels de l'affine sur `MattSwift_03.mp4` (sujet mobile réel) |
 | 2026-07-09 → 07-15 | **Compositing bg-locked** (`composite_bg_locked`, [détails ci-dessous](#benchmark-a--affine-vs-b--flow-prop-vs-c--bg-locked)) : ne plus "aligner" le fond, le figer exactement à `D_ref` (variance nulle par construction) ; la depth propagée par flow n'est utilisée que dans le masque dynamique (dilaté + feathered) | ✅ mergé (`bg_lock_dilate_px`, `bg_lock_feather_px` dans `run_video`) | **Gagnant** : std temporel fond 0.097m → 0.0001m (~1000×), flicker p2p 0.032→0.000m ; foreground aussi moins de flicker que l'affine seul (0.237 vs 0.354m) |
 | — | **Lissage temporel de profondeur** (médiane/gaussienne glissante sur fenêtre de frames) | ✅ implémenté (`depth_smoothing`, `depth_smoothing_window`, `depth_smoothing_method`) ; benchmarké combiné à bg-lock, [voir ci-dessous](#benchmark-solutionspy--configs-de-stabilité) | **Gagnant combiné avec bg-lock** : `bglock_sol1_median_w5` = config de production |
 | — | Cohérence forward-backward du flow (détection occlusion) | Partiellement couvert par la vérification fb interne à la propagation par flow ; pas branché séparément sur le gel de la mémoire SAM | Non fait en tant que tel |
@@ -22,6 +22,8 @@ en distinguant fond statique (doit être parfaitement stable) et objets mobiles
 | — | Tracking de points / identité des Gaussiennes entre frames | ⭐⭐⭐ effort et risque élevés, explicitement reporté ("dernier recours") | Non tenté |
 | parallèle | **Comparaison de générateurs** pager vs unisharp360, via nouvelles métriques (`bg_depth_cv`, spike count, [DEPTH_METRICS_IMPLEMENTATION.md](A1_DEPTH_METRICS_IMPLEMENTATION.md)) | ✅ chemin unisharp360 mergé en parallèle du bg-lock (commit `23eeccf`) | UniSHARP montrait un CV de fond plus faible sur les premiers tests |
 | 2026-07-21 | **GPU-resident depth chain + composite-on-GPU + Tier-3 single-pass WAFT** ([B1_VRAM_TIME_REDUCTION_PLAN.md](B1_VRAM_TIME_REDUCTION_PLAN.md)) | ✅ mergé (`d23cb01`), composite-on-GPU par défaut | Wall 148.8→88.4s (−40%), VRAM 37,092→20,353MB (−45%), métriques quasi-identiques |
+| 2026-07-31 | **Validation full-frame / full-stride** (`scripts/run_scene03_fullres_bglock.py`, `skip_step=1, stride=1`) sur `scene_03.mp4` (café intérieur, personnes, dataset jamais utilisé auparavant) — pas de sous-échantillonnage benchmark, config proche production | ✅ run complet | 617 frames, 2020s, VRAM peak 31,146MB — confirme que bglock passe à l'échelle en pleine résolution sans changement d'ordre de grandeur du coût VRAM/temps vs les runs sous-échantillonnés |
+| 2026-08-17 | **Réactivation du decay de confiance + état propagé warpé** (audit P0 T1 §4.1/§4.2, [benchmarks/T1_T2_P0_AUDIT.md](../benchmarks/T1_T2_P0_AUDIT.md), résultats [benchmarks/confdecay_2026-08-17/](../benchmarks/confdecay_2026-08-17/RESULTS.md)) : le `decay=0.85` annoncé depuis 2026-07-09 **n'avait jamais compté** — un reset à 1.0 à chaque frame de confiance rendait `running_confidence` binaire {0, 0.85}, donc un poids de blend fixe, pas une décroissance. L'état porté est maintenant un **âge par pixel** (frames depuis le dernier ré-ancrage), **warpé le long du flow** comme la depth qu'il décrit (§4.2), et la confiance vaut `max(conf_floor, decay**age)` | ✅ mergé, défaut ON (`SPAG_CONF_DECAY=0.85`, `SPAG_CONF_FLOOR=0.5`) ; `SPAG_CONF_LEGACY=1` restitue l'ancien chemin à l'identique | MattSwift : la fidélité du mouvement fg passe de **0.692 → 0.923** vs l'estimation monoculaire brute — l'ancienne "stabilité" fg (`fg_depth_cv` 0.1307 vs 0.1582) était donc à ~31% du mouvement réel supprimé. `bg_depth_cv` inchangé, VRAM identique, temps dans le bruit. **Toute mesure antérieure au 2026-08-17 a été prise sous l'ancien chemin** |
 
 ## Où on en est (`spag4d/video.py`, config de production)
 
@@ -189,6 +191,35 @@ stabilité bg ET fg simultanément. `sol1_median_w5` seul reste le fallback si l
 ~80s/vidéo moins cher).
 
 ---
+
+## Assets de présentation + comparaisons additionnelles (2026-07-31)
+
+Pour un support PPT expliquant le mécanisme bglock (D_ref calculé une seule
+fois avant la boucle par-frame, puis réutilisé deux fois : comme **cible de
+régression** de l'alignement affine par frame sur les pixels statiques, et
+comme **valeur figée exacte** du compositing final) :
+
+- `.sandbox/bglock_explainer/bglock_pipeline_diagram.png` — diagramme
+  matplotlib avec une zone "COMPUTED ONCE" (D_ref) séparée visuellement d'une
+  zone "EVERY FRAME t" (alignement + propagation + compositing), flèche
+  explicite D_ref → Affine align labellisée "regression target".
+- `.sandbox/bglock_explainer/bglock_bg_flicker_evidence.png` — graphe
+  flicker fond réel affine vs bglock sur `accident_electrique_02`.
+- `.sandbox/bglock_explainer/bglock_bullets.md` — notes orateur, avec une
+  section détail sur la mécanique de `propagate_depth_via_flow` (warp
+  backward via `flow_fwd`, confiance = FB-consistency × pole-margin ×
+  decay temporel 0.85, disocclusion = masque SAM *de la frame courante*, pas
+  de la précédente) et `composite_bg_locked` (alpha = masque dilaté+feathered,
+  cas limite `D_ref` NaN).
+
+Nouveaux clips de comparaison (scripts existants réutilisés tels quels, voir
+[Note] dans `CLAUDE.md`) : `fg_depth_flicker.mp4` (affine vs bglock) sur
+`atelier_1`, `da360_vs_pager_indepscale_fg_flicker.mp4` (da360 vs pager) sur
+`circulation_site_1_edit_coupe` — ce dernier via un nouveau script pérennisé
+`scripts/render_indepscale_fg_flicker.py` (percentiles 2-98 **indépendants**
+par côté, nécessaire car da360 = profondeur métrique et pager = profondeur
+scale-invariant ; un percentile partagé y écraserait artificiellement le côté
+à plus petite échelle).
 
 ## Idées explorées mais non retenues / non testées
 

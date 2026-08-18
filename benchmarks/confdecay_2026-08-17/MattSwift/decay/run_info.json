@@ -1,0 +1,46 @@
+{
+  "config": {
+    "skip_step": "2",
+    "stride": "4",
+    "active_generator": "da360",
+    "depth_correction": "bglock",
+    "depth_smoothing": "True",
+    "depth_smoothing_window": "5",
+    "depth_smoothing_method": "median",
+    "temporal_consistency": "False",
+    "freeze_bg": "True",
+    "outlier_pruning": "0.3",
+    "grazing_angle": "85.0",
+    "sparse_pruning": "0.1",
+    "env": {
+      "SPAG_SAM3_MAXSIZE": "768",
+      "SPAG_SAM3_BF16": null,
+      "SPAG_DETERMINISTIC": "1",
+      "SPAG_OCCL_FBGATE": "1",
+      "SPAG_LOCK_ACTIVITY": null,
+      "CUDA_VISIBLE_DEVICES": "1",
+      "SPAG_CONF_LEGACY": null,
+      "SPAG_CONF_DECAY": "0.85",
+      "SPAG_CONF_FLOOR": "0.5"
+    }
+  },
+  "time_seconds": 426.3653709888458,
+  "vram_max_mb": 10348.904296875,
+  "n_frames": 300,
+  "n_objects": 6,
+  "mean_splats": 72018.00333333333,
+  "stability": {
+    "bg_depth_cv": 0.0005495415763917981,
+    "bg_depth_mean": 5.195305606524149,
+    "bg_depth_std": 0.0028550364328464276,
+    "bg_delta_max": 0.004286289215087891,
+    "bg_delta_mean": 0.0009251852896699937,
+    "bg_delta_std": 0.0007901616743513779,
+    "bg_spike_count": 0,
+    "bg_spikes_per_frame": 0.0,
+    "fg_delta_max": 0.381211519241333,
+    "fg_delta_mean": 0.023228175664027798,
+    "fg_delta_std": 0.037591263893639454,
+    "fg_depth_cv": 0.15815647956475348
+  }
+}

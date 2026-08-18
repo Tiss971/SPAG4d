@@ -82,7 +82,17 @@ class PaGeRModel:
         # Record the effective native ERP (≈4 equatorial faces wide, 2 tall) for honest logging.
         face = int(getattr(cfg, "face_size", 504))
         self.native_resolution: tuple[int, int] = (2 * face, 4 * face)
+        # §10.1 backend contract (bglock_open_questions.md): the two attributes
+        # PaGeR didn't already declare, mirroring DA360Model's set.
+        self.invalid_pixel_signal = "sky_mask"  # predict()'s 2nd return value
+        self.value_range = (1e-2, 200.0)  # set_depth_range() clamp in .load()
         self._classifier = None
+        # §4.4 (benchmarks/T1_T2_P0_AUDIT.md): cached on first classify() call so a
+        # borderline scene can't flip indoor/outdoor mid-sequence and step the global
+        # scale, and so CLIP runs once per video instead of once per frame. Currently
+        # inert in production (metric=False, da360 is the active generator) but this
+        # is the seam the E1 pager plan will exercise.
+        self._scale_label: str | None = None
 
     @classmethod
     def load(cls, device: torch.device = torch.device("cuda"),
@@ -117,13 +127,16 @@ class PaGeRModel:
         if not self.metric:
             return {"scale_indoor", "scale_outdoor"}, False
         # Metric: route one scale head via CLIP indoor/outdoor on de-normalized faces.
-        if self._classifier is None:
-            self._classifier = _get_classifier(self.device)
-        mean = torch.tensor(_IMAGENET_MEAN, device=cube.device).view(1, 3, 1, 1)
-        std = torch.tensor(_IMAGENET_STD, device=cube.device).view(1, 3, 1, 1)
-        cube01 = cube[0] * std + mean  # (6,3,h,w) in ~[0,1]
-        label, _ = self._classifier.classify(cube01)
-        keep = _SCALE_HEADS[label]
+        # Classified once and cached (§4.4) — a per-frame reclassification let a
+        # borderline scene flip scale heads mid-sequence, stepping the global scale.
+        if self._scale_label is None:
+            if self._classifier is None:
+                self._classifier = _get_classifier(self.device)
+            mean = torch.tensor(_IMAGENET_MEAN, device=cube.device).view(1, 3, 1, 1)
+            std = torch.tensor(_IMAGENET_STD, device=cube.device).view(1, 3, 1, 1)
+            cube01 = cube[0] * std + mean  # (6,3,h,w) in ~[0,1]
+            self._scale_label, _ = self._classifier.classify(cube01)
+        keep = _SCALE_HEADS[self._scale_label]
         return {h for h in _SCALE_HEADS.values() if h != keep}, True
 
     @torch.inference_mode()

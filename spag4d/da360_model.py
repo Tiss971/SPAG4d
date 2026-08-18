@@ -53,6 +53,17 @@ class DA360Model:
         self.device = device
         self.model.eval()
 
+        # §10.1 backend contract (bglock_open_questions.md) -- declared, not
+        # hardcoded downstream. DA360 was radial by construction (ERPCircularConv2d
+        # geometry matches ERP ray directions, same family as PaGeR's declared
+        # "radial") but never said so explicitly; mirrors PaGeR's three declared
+        # attributes and adds the two PaGeR doesn't have either.
+        self.depth_convention = "radial"
+        self.native_resolution: tuple[int, int] = (DA360_INPUT_H, DA360_INPUT_W)
+        self.invalid_pixel_signal = None  # no sky/validity mask; predict() returns depth only
+        self.metric = False  # per-frame median-anchored to ~5.0m, not true metric scale
+        self.value_range = (0.0, float("inf"))  # unbounded, no clamp applied
+
     @classmethod
     def load(
         cls,

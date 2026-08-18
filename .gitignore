@@ -138,3 +138,8 @@ temp_spag4d/
 # Depth-stability benchmark: heavy PLY point clouds (keep stats.json + comparison.png only)
 benchmark_*/
 .sandbox/
+# Benchmarks: keep the JSON/MD/logs, never the heavy per-frame dumps
+benchmarks/**/depth_maps/
+benchmarks/**/*.npy
+benchmarks/**/gaussians/
+benchmarks/**/images/

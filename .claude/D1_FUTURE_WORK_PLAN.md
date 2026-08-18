@@ -285,6 +285,81 @@ obj-1 caveat resolved, and confirmed to materially improve tracking through seve
 (**+6.4 % present-frames net** on the jam clip, no regressions). Ready to ship as a committed
 opt-in flag.
 
+## `SPAG_LOCK_ACTIVITY` — decouple the activity mask from the bg-lock decision — ✅ SHIPPED DEFAULT-ON 2026-07-28
+
+**The bug.** `alignement_mask="sam_and_activity"` builds one `fused_mask = activity | sam`
+and uses it for two jobs that need different masks:
+
+1. *Which pixels to exclude from the alignment fit.* This is what the activity mask is
+   actually for — a pixel with high whole-video temporal std is untrustworthy as a
+   constraint on the fit. Correct use.
+2. *Which pixels are moving right now*, in `composite_bg_locked`. Category error: activity
+   is a **whole-video** statistic driving a **per-frame** decision. One frame of motion
+   unlocks a pixel for the entire clip, and edge flicker / chromatic aberration from the
+   capture unlocks pixels that never move at all. Those pixels then receive
+   flow-propagated object depth — preserving exactly the flicker bg-lock exists to remove.
+
+`accident_electrique_02` was immune only because it ran `alignement_mask="sam"`, where the
+two masks are identical.
+
+**The fix.** `lock_mask = sam_mask` for the composite (and the disocclusion mask feeding
+`propagate_depth_via_flow`); the alignment fit and every reported metric keep using
+`fused_mask`, so metrics stay comparable across the flag. Default on;
+`SPAG_LOCK_ACTIVITY=0` restores the old behaviour. No-op under `alignement_mask="sam"`.
+
+**Measured** on `circulation_site_1_edit_coupe` (156 frames, A/B with identical flags):
+
+| pixel class | metric | OFF | ON |
+|---|---|---|---|
+| activity-only (3.4 % of frame) | drift mean / p99 / CV | 16.5 % / 211 % / 5.40 % | **1.01 % / 15.6 % / 0.245 %** |
+| pure-static (90.5 %) | drift mean / p99 / CV | 0.515 % / 6.11 % / 0.230 % | **0.011 % / 0.000 % / 0.004 %** |
+| ever-SAM foreground | CV | 32.8 % | 30.2 % |
+
+SPAG4D's own `_depth_stats`: `out/std_p99` 0.352 → 0.00128, while `in/std_max` **rose**
+13.49 → 14.98 — peak real foreground motion is preserved, so this denoises rather than
+freezes.
+
+Downstream NPZ init, same `normalize_transform.npy`: background 3,842,578 → **575,990**
+points (voxel dedup 5× → **26×**), total 4,263,032 → 996,444, **foreground bit-identical at
+420,454**. Unlocked activity pixels had been jittering across voxel boundaries and defeating
+dedup. The scene now matches `accident_electrique_02`'s profile (55.9 % bg, 29×).
+
+**Known cost, accepted.** Genuinely moving background that SAM does not segment — foliage,
+water, rippling fabric, a video screen — gets its *geometry* frozen to the temporal median.
+Downstream forces background velocity to exactly zero regardless, so that motion was never
+reaching the 4D model anyway.
+
+**Open item — static geometry / dynamic appearance (video screens).** For a screen the
+frozen geometry is *correct*: the surface really is a static plane and only the RGB changes.
+The question is whether anything downstream can represent that. Partial answer, checked
+2026-07-28:
+
+- FreeTimeGS's `sh0`/`shN` are plain per-Gaussian parameters with **no time dimension**
+  (`simple_trainer_freetime_4d_pure_relocation.py`). Its only time-varying mechanisms are
+  position (`means + velocity*(t - t_center)`) and temporal opacity
+  (`sigma(t) = exp(-0.5*((t - t_center)/duration)^2)`). So a *single* Gaussian cannot change
+  colour; the only representable encoding is a stack of co-located Gaussians with different
+  `t_center` and short `duration`, each holding one fixed colour, fading in and out.
+- The NPZ builder cannot produce that stack for background. Screen pixels are background
+  (the fg/bg split keys off `mask_{idx}.npy` = `sam_mask`), and background is voxel-deduped
+  across all keyframes by `_median_by_key`, which medians **colour** as well as position,
+  then gets `duration = --bg-single-copy-duration` (always-on). One always-on Gaussian
+  holding the temporal median colour = a grey smear.
+
+**This is pre-existing, not caused by `SPAG_LOCK_ACTIVITY`** — the flag changes depth, not
+the fg/bg split, so screens were already being median-averaged before it. What the flag does
+change is that the smear is now geometrically clean instead of also jittering in depth.
+
+Remaining question is what to do about it, and it is upstream of the trainer: treat
+"static geometry, dynamic appearance" as a third mask class that goes down the
+per-keyframe (non-deduped, short-duration) path so the opacity stack can encode it — rather
+than reverting the activity lock, which would only restore the depth jitter. Only worth
+doing if a screen-heavy clip actually looks wrong. `tissc` and `scene01` are the candidates.
+
+Re-converted with the flag on 2026-07-28: `circulation_site_1_edit_coupe`,
+`accident_electrique_fast2`, `tissc`, `scene01` (`accident_electrique_02` needs no re-run —
+`alignement_mask="sam"`).
+
 ## Dependency order
 
 ```
@@ -310,7 +385,9 @@ P4 and occlusion follow.
 
 ## Explicitly not on this list (dead ends, confirmed)
 
-- **Background stabilization** — solved (bg-lock, variance ~0). No further work.
+- **Background stabilization** — solved (bg-lock, variance ~0), and as of 2026-07-28 that
+  now actually holds under `alignement_mask="sam_and_activity"` too (`SPAG_LOCK_ACTIVITY`,
+  above). No further work.
 - **Robust affine (RANSAC/Siegel)** — no value while bg is locked, not re-estimated.
 - **`sol4` multi-frame reference** — confirmed no-op, abandoned.
 - **vipe replacement via Open-d4rt** — evaluated, not viable (Open-d4rt/OPEN_D4RT_EVALUATION.md).
