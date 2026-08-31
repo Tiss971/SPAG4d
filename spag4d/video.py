@@ -1471,13 +1471,25 @@ def run_video(
             if idx >= 1 and (idx - 1) < len(flows_fwd):
                 np.save(depth_npy_dir / f"flow_{idx}.npy", flows_fwd[idx - 1].astype(np.float32))
 
+        # Foreground depth_min must NOT reuse the background-reference-derived
+        # `depth_min` computed above: depth_ref_np is a static/background estimate
+        # that, on a fixed camera, by construction never contains a person standing
+        # close to the lens. Its 1st-percentile-derived depth_min (e.g. ~2.6m on a
+        # scene whose empty background starts at ~3.3m) then silently zeroes out
+        # every dynamic-subject pixel closer than that in filter_gaussian_candidates'
+        # `depth_stride > depth_min` check, frame after frame -- close-range people
+        # go fully invisible while the SAM3 mask around them looks correct. depth_min
+        # exists to reject degenerate near-zero/behind-camera depth, not to gate real
+        # foreground subjects, so floor it low and independently of the background
+        # estimate here. See docs/DISPO_RDV_CLOSE_RANGE_PRUNING_FIX.md.
+        fg_depth_min = min(depth_min, 0.15) if depth_min is not None else 0.15
         gaussians = to_gaussians(
             converter,
             depth_for_gaussians,
             image_tensor,
             stride,
             H,
-            depth_min,
+            fg_depth_min,
             depth_max,
             sky_threshold,
             outlier_pruning,
