@@ -87,7 +87,7 @@ class PaGeRModel:
         self.invalid_pixel_signal = "sky_mask"  # predict()'s 2nd return value
         self.value_range = (1e-2, 200.0)  # set_depth_range() clamp in .load()
         self._classifier = None
-        # §4.4 (benchmarks/T1_T2_P0_AUDIT.md): cached on first classify() call so a
+        # §10.4 (benchmarks/bglock_open_questions.md): cached on first classify() call so a
         # borderline scene can't flip indoor/outdoor mid-sequence and step the global
         # scale, and so CLIP runs once per video instead of once per frame. Currently
         # inert in production (metric=False, da360 is the active generator) but this

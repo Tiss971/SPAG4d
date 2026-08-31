@@ -1,3 +1,4 @@
+import bisect
 import contextlib
 import csv
 import gc
@@ -70,7 +71,6 @@ def print_gpu_stats(label: str = "", file=None):
             file=file
         )
         print("=" * 50, file=file)
-
 
 def extract_video_frames(video_path: str, output_folder:str, skip_step: int = 10, export: bool = False) -> tuple[np.ndarray, int]:
     cap = cv2.VideoCapture(video_path)
@@ -311,41 +311,6 @@ def to_gaussians(
 
     return gaussians
 
-
-def stabilize_fg_depth_scale(
-    depth_current: np.ndarray,
-    depth_history: list,  # liste de depth_np précédentes (alignées)
-    mask: np.ndarray,
-    window: int = 3,
-    jump_threshold: float = 0.5,  # calibré sur ton graphique : écarts > 0.5 = outlier
-) -> np.ndarray:
-    """
-    Détecte un saut ponctuel de depth médiane sur le masque foreground
-    et le remplace par la médiane des frames voisines (sans toucher au fond).
-    """
-    if len(depth_history) < (window - 1):
-        return depth_current
-
-    fg = mask > 0
-    if fg.sum() == 0:
-        return depth_current
-
-    current_median = np.median(depth_current[fg])
-    recent_medians = [np.median(d[fg]) for d in depth_history[-window:]]
-    neighbor_median = np.median(recent_medians)
-
-    delta = abs(current_median - neighbor_median)
-
-    if delta > jump_threshold:
-        # Outlier ponctuel détecté → correction par ratio global
-        scale_correction = neighbor_median / current_median if current_median > 0 else 1.0
-        out = depth_current.copy()
-        out[fg] *= scale_correction
-        return out
-
-    return depth_current
-
-
 def run_video(
     converter: SPAG4D,
     video_path: str | Path,
@@ -469,15 +434,13 @@ def run_video(
         diag_dir.mkdir(parents=True, exist_ok=True)
 
     # Optional determinism (opt-in, default OFF). Production keeps cuDNN autotune
-    # for throughput; enable for benchmarking/gating where run-to-run
-    # reproducibility matters more than speed. Motivation: fg_depth_cv swung 3.75x
-    # between identical reruns (B1 MattSwift) because nothing seeds RNG/cuDNN and
-    # the marginal found_object contour threshold flips which frames register a
-    # track. See .claude/D1_FUTURE_WORK_PLAN.md P2. cudnn.benchmark=False also
-    # drops the autotune warmup (the throughput cost we gate here). Deliberately
-    # NOT using torch.use_deterministic_algorithms(True): it raises on WAFT/SAM3
-    # ops that lack deterministic kernels; seeds + cudnn.deterministic is the safe
-    # subset that stabilizes this pipeline's observed nondeterminism.
+    # for throughput; enable for benchmarking/gating where reproducibility matters
+    # more than speed. Motivation: fg_depth_cv swung 3.75x between identical
+    # reruns (B1 MattSwift) since nothing seeds RNG/cuDNN and the marginal
+    # found_object contour threshold flips which frames register a track. See D1
+    # P2. Deliberately NOT torch.use_deterministic_algorithms(True): it raises on
+    # WAFT/SAM3 ops lacking deterministic kernels; seeds + cudnn.deterministic is
+    # the safe subset that stabilizes this pipeline's nondeterminism.
     if os.environ.get("SPAG_DETERMINISTIC", "0") == "1":
         seed = int(os.environ.get("SPAG_SEED", "42"))
         np.random.seed(seed)
@@ -580,68 +543,31 @@ def run_video(
         meta["new_W"] = new_W
         meta["new_H"] = new_H
 
-        # Tier 3: single WAFT pass (opt-in via SPAG_SINGLE_PASS=1; default off).
-        # Normally the flow phase runs WAFT twice for bglock — once
-        # forward-only (model.run) to build the SAM magnitude masks, once
-        # bidirectional+seam-padded (compute_bidirectional_flow) for depth
-        # propagation. When enabled, derive the SAM mask from the SAME
-        # unified flow instead, so WAFT runs once (~38% flow-phase time win on
-        # long clips, VRAM-neutral). NOT lossless: the SAM mask/SAM3 tracking
-        # schedule is unaffected (proven byte-identical to baseline on
-        # scene01), but propagate_depth_via_flow below also reuses this same
-        # flow for foreground depth, and here it's computed at
-        # seam_pad=SPAG_SP_SEAMPAD (default 0) instead of the two-pass
-        # baseline's flow_seam_pad (default 64) -- silently dropping ERP
-        # seam-wraparound correction for the propagated foreground depth
-        # (confirmed root cause on scene01: stabilized_fg_median is the only
-        # depth_metrics array that diverges; raw/aligned/deltas all match).
-        # Do not flip this default without fixing that seam-pad gap first;
-        # see .claude/B1_VRAM_TIME_REDUCTION_PLAN.md.
+        # Tier 3: single WAFT pass (opt-in SPAG_SINGLE_PASS=1). Derives the SAM
+        # mask from the same unified flow instead of running WAFT twice (~38%
+        # time win). NOT lossless: reuses seam_pad=0 flow for fg depth propagation
+        # too, dropping ERP seam-wraparound correction (root cause of scene01's
+        # stabilized_fg_median divergence). Don't flip default; see B1 doc.
         single_pass = (
             depth_correction == "bglock"
             and os.environ.get("SPAG_SINGLE_PASS", "0") == "1"
         )
         if single_pass:
-            # seam_pad for the single unified pass. 0 (default) => the forward
-            # flow is computed on the raw (non-padded) frames, so the derived SAM
-            # magnitude mask is byte-identical to the two-pass baseline's mask
-            # (same infer_pair) — the mask shift disappears. The only thing given
-            # up vs the two-pass path is seam-crossing propagation, which bg-lock
-            # doesn't rely on (background is locked to depth_ref regardless).
+            # seam_pad=0 default keeps the SAM mask byte-identical to baseline
+            # (same infer_pair); the cost is dropped seam-crossing propagation,
+            # which bg-lock doesn't rely on.
             sp_seam = int(os.environ.get("SPAG_SP_SEAMPAD", "0"))
-            # Decoupled-pass fix (opt-in, default off) for the
-            # stabilized_fg_median/fg_depth_cv regression documented in
-            # .claude/C1_SINGLE_PASS_SEAMPAD_ROOTCAUSE.md: when on, redo the
-            # flow at flow_seam_pad (matching the two-pass baseline's
-            # propagation flow) for propagation only, leaving the sp_seam
-            # flow above untouched for mask derivation. TESTED 2026-07-24:
-            # functionally perfect (stabilized_fg_median byte-identical to
-            # baseline on all 158 scene01 frames) but +15% SLOWER than the
-            # two-pass baseline -- it runs 4 infer_pair/pair vs baseline's 3,
-            # so it erases single_pass's entire time win and then some. Kept
-            # only as proof-of-root-cause / scaffolding for a conditional
-            # (bbox-near-seam) variant; NOT a shippable optimization. See C1.
+            # Decoupled-pass fix (opt-in, dead end -- see C1): redo flow at
+            # flow_seam_pad for propagation only. Functionally perfect but +15%
+            # slower than baseline, erasing single_pass's whole time win.
             fix_seam_gap = (
                 os.environ.get("SPAG_SP_FIX_SEAMGAP", "0") == "1"
                 and sp_seam != flow_seam_pad
             )
-            # P4 (opt-in, SPAG_SP_COND_SEAMPAD=1): the *conditional* form of the
-            # fix_seam_gap dead end. CONFIRMED DEAD END 2026-07-27 -- kept opt-in as
-            # scaffolding + proof, do NOT ship. The idea was to recompute the
-            # seam-padded propagation flow ONLY on pairs where moving foreground
-            # touches the ERP seam band, on the assumption that seam padding is a
-            # *local* correction. It is not: pad_circular_horizontal pads the WHOLE
-            # frame and feeds the wider image to WAFT (a full-frame network), so
-            # seam_pad=0 vs 64 perturbs interior flow just as much as seam-band flow
-            # (measured on scene01: mean|Δflow| interior 0.0351 vs seam-band 0.0349
-            # -- essentially uniform). Every frame's propagation flow differs, and
-            # stabilized_fg_median diverges across the whole propagation chain
-            # regardless of seam adjacency. Empirical: recomputing 29/157 flagged
-            # scene01 frames left fg_depth_cv at 0.0154 (plain single-pass) vs the
-            # 0.0452 two-pass baseline -- no recovery. Only fix_seam_gap (recompute
-            # ALL frames, +15%) matches baseline. See D1 Priority 4. n_seam_recompute
-            # below still serves as the corpus seam-adjacency measurement.
-            # fix_seam_gap (if also set) wins = unconditional recompute.
+            # P4 conditional variant of fix_seam_gap -- CONFIRMED DEAD END
+            # 2026-07-27, kept as scaffolding only. Seam padding isn't local
+            # (pads the whole frame into WAFT), so recomputing only near-seam
+            # pairs doesn't recover baseline; see D1 Priority 4.
             cond_seam = (
                 os.environ.get("SPAG_SP_COND_SEAMPAD", "0") == "1"
                 and sp_seam != flow_seam_pad
@@ -1048,36 +974,10 @@ def run_video(
     # interpolating it (alpha stays soft for anything else that wants it).
     hard_depth_cutover = os.environ.get("SPAG_HARD_DEPTH_CUTOVER", "0") == "1"
 
-    # Default on (SPAG_LOCK_ACTIVITY=0 to opt out): lock activity-only pixels to depth_ref
-    # instead of giving them flow-propagated object depth. `alignement_mask="sam_and_activity"`
-    # builds one fused_mask (SAM | activity) and uses it for two different jobs: which
-    # pixels to EXCLUDE FROM THE ALIGNMENT FIT (activity's real purpose -- a
-    # high-variance pixel is untrustworthy for estimating the fit) and which pixels are
-    # MOVING RIGHT NOW in the bg-lock composite. The second use is a category error:
-    # activity is a whole-video std, so one frame of motion unlocks a pixel for the
-    # entire clip, and edge flicker / chromatic aberration unlocks pixels that never
-    # move at all. Those pixels then carry propagated object depth, which preserves
-    # exactly the flicker bg-lock exists to remove (measured on
-    # circulation_site_1_edit_coupe: activity-only pixels, 3.4% of the frame, drift
-    # 16.5% mean / 211% p99 between frames, vs 0.000% p99 on locked static pixels in an
-    # alignement_mask="sam" scene). Locking them is safe because depth_ref comes from a
-    # SAM-masked temporal median -- at a pixel an object merely crosses, the median is
-    # the true background -- and the genuinely-unobservable case is already carved out
-    # separately (always_masked_mask -> depth_ref = NaN, no Gaussians).
-    # Measured downstream on the same clip: background init points 3.84M -> 0.58M (voxel
-    # dedup 5x -> 26x), foreground point count bit-identical, which is what the diagnosis
-    # predicts -- unlocked activity pixels were jittering across voxel boundaries and
-    # defeating dedup.
-    #
-    # KNOWN COST, accepted: genuinely moving background that SAM does not segment --
-    # foliage, water, a video screen, rippling fabric -- gets its GEOMETRY frozen to the
-    # temporal median. For foliage/water/fabric that is a real (small) loss of depth
-    # motion; downstream forces background velocity to exactly zero anyway, so it was
-    # never propagated into the 4D model regardless. For a screen it is arguably correct:
-    # the geometry really is static and only the RGB changes. Whether the trainer can
-    # then fit that appearance-only variation on static Gaussians is an open question
-    # (see D1_FUTURE_WORK_PLAN.md). Set SPAG_LOCK_ACTIVITY=0 for a clip where background
-    # depth motion genuinely matters. The alignment fit keeps using fused_mask either way.
+    # Default on (SPAG_LOCK_ACTIVITY=0 to opt out): lock activity-only pixels to
+    # depth_ref -- activity is a whole-video std, so gating compositing on it
+    # reintroduces the flicker bg-lock removes (211% p99 drift unlocked vs 0.000%
+    # locked). Cost: SAM-missed moving background gets its geometry frozen; see D1.
     lock_activity = os.environ.get("SPAG_LOCK_ACTIVITY", "1") != "0"
 
     (output_folder / "gaussians").mkdir(parents=True, exist_ok=True)
@@ -1088,6 +988,25 @@ def run_video(
     if depth_npy_dir is not None:
         depth_npy_dir = Path(depth_npy_dir)
         depth_npy_dir.mkdir(parents=True, exist_ok=True)
+        np.save(depth_npy_dir / "depth_ref.npy", depth_ref_np.astype(np.float32))
+
+    # §6.3 mask injection: opt-in proxy-GT test. Forces a genuinely static patch
+    # into `lock_mask` so it runs the full dynamic-path machinery even though
+    # depth_ref there IS ground truth -- gives an accuracy measurement, not just
+    # stability. SPAG_MASK_INJECT='[[lat_frac, lon_frac, half_size_px], ...]',
+    # default unset = no-op.
+    _mask_inject_rects: list[tuple[int, int, int, int]] = []
+    _mask_inject_env = os.environ.get("SPAG_MASK_INJECT")
+    if _mask_inject_env:
+        import json as _json
+        _n_rows, _n_cols = depth_ref_np.shape
+        for _lat_frac, _lon_frac, _half in _json.loads(_mask_inject_env):
+            _cy = int(_lat_frac * (_n_rows - 1))
+            _cx = int(_lon_frac * (_n_cols - 1))
+            _y0, _y1 = max(0, _cy - _half), min(_n_rows, _cy + _half)
+            _x0, _x1 = max(0, _cx - _half), min(_n_cols, _cx + _half)
+            _mask_inject_rects.append((_y0, _y1, _x0, _x1))
+        print(f"[SPAG4D] SPAG_MASK_INJECT active: {len(_mask_inject_rects)} patch(es) {_mask_inject_rects}")
     n_gaussians = []
     # Tier 4.5: async PLY writes. save_ply_gsplat's GPU->CPU sync, numpy
     # encoding and disk I/O are pure post-processing on already-computed
@@ -1135,17 +1054,13 @@ def run_video(
 
     t_depth_loop0 = time.time()
     # Tier 4.4: prefetch DA360 depth for frame i+1. depth_engine.predict is a
-    # GPU op; issuing it before frame i's CPU/host-sync-heavy post-processing
-    # (align/smoother/propagate/composite, several .cpu()/.item() calls) lets
-    # its kernels queue and run on the GPU while the host is busy with frame
-    # i's bookkeeping, instead of waiting until frame i+1's loop iteration to
-    # even launch it. Purely a scheduling reorder — depth values are
-    # unchanged (same predict() call, same inputs), so output is lossless.
-    # Run the prefetch on its own CUDA stream so its kernels can actually
-    # execute concurrently with the main stream's post-processing, instead of
-    # just being queued after it (same-stream ordering wouldn't overlap
-    # anything — the host-blocking .cpu()/.item() sync points in the
-    # align/smoother/propagate block only drain the *current* stream).
+    # GPU op; issuing it before frame i's host-sync-heavy post-processing
+    # (align/smoother/propagate/composite) lets its kernels run on the GPU
+    # while the host is busy with frame i's bookkeeping. Purely a scheduling
+    # reorder -- same predict() call/inputs, so output is lossless. Runs on
+    # its own CUDA stream so it can execute concurrently with the main
+    # stream's post-processing (same-stream ordering wouldn't overlap
+    # anything -- the host-blocking sync points only drain the current stream).
     depth_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
     def _predict_depth(frame_np):
@@ -1213,6 +1128,16 @@ def run_video(
             fused_t if lock_mask is fused_mask
             else (torch.from_numpy(lock_mask).to("cuda") if gpu_depth_chain else None)
         )
+
+        if _mask_inject_rects:
+            # np.maximum always returns a new array, so this never mutates
+            # fused_mask/sam_mask even where lock_mask aliases one of them.
+            _inject_np = np.zeros_like(lock_mask)
+            for _y0, _y1, _x0, _x1 in _mask_inject_rects:
+                _inject_np[_y0:_y1, _x0:_x1] = 1
+            lock_mask = np.maximum(lock_mask, _inject_np)
+            if gpu_depth_chain:
+                lock_t = torch.maximum(lock_t, torch.from_numpy(_inject_np).to("cuda"))
 
         # Align depth_ref_np
         median_depth_fg.append(float(np.median(
@@ -1730,6 +1655,8 @@ def align_depth_frame(
     ransac_max_trials: int = 100,
     verbose: bool = False,
     diag_out: "dict | None" = None,
+    correction_mask: "np.ndarray | None" = None,
+    apply_everywhere: bool = False,
 ) -> np.ndarray:
     """
     Aligne depth_frame sur depth_ref en estimant scale s et shift t
@@ -2051,77 +1978,49 @@ def segment_with_flows(
     gpus_to_use = [torch.cuda.current_device()]
     video_predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use)
 
-    # Tier 4.3 (opt-in, SPAG_SAM3_SCALE<1.0): SAM3 decodes resource_path itself at
-    # native resolution -- pass a downscaled in-memory list of PIL frames instead
-    # of a file path. load_resource_as_video_frames (sam3/model/io_utils.py)
-    # accepts `resource_path` as either a path or a list of PIL.Image, and uses
-    # exactly len(resource_path) as num_frames -- this sidesteps an earlier
-    # attempt that wrote a temporary downscaled .mp4 and pointed resource_path at
-    # it, which crashed with IndexError because SAM3's own video decoder didn't
-    # reliably reproduce the same frame count as what was written (codec-level
-    # frame drop/pad), desyncing frame_idx between the two frame-counting paths.
-    # A plain Python list has no such ambiguity: what we build is what SAM3 sees,
-    # frame-for-frame. Masks upsample back to full res below. NOT lossless:
-    # coarser input -> different contour/box detections -> different SAM3
-    # prompts and masks.
-    #
-    # IMPORTANT: this list must be built at NATIVE frame count, not from
-    # viz_frames -- viz_frames is already decimated by skip_step (len ==
-    # n_total_frames, the post-skip count), but add_prompt's frame_index
-    # (below, `s['idx'] * skip_step`) and propagate_in_video's frame indices
-    # are in NATIVE frame space. A list built from viz_frames is too short by
-    # a factor of skip_step, so add_prompt's frame_idx runs past the end of
-    # the list -> IndexError inside SAM3's own code (confirmed by a real
-    # crash). Re-decode the native video directly instead: one decode pass,
-    # exact native frame count, no re-encode/re-decode round trip like the
-    # old mp4-proxy attempt.
-    sam3_scale = float(os.environ.get("SPAG_SAM3_SCALE_DISABLE", "0.5"))
-    sam3_maxsize = int(os.environ.get("SPAG_SAM3_MAXSIZE", "1536"))
+    # Tier 4.3 (opt-in, SPAG_SAM3_SCALE<1.0): pass a downscaled in-memory PIL
+    # frame list instead of a file path (avoids an earlier temp-mp4-proxy
+    # IndexError from frame-count desync). Not lossless -- coarser input changes
+    # SAM3's detections. Built at NATIVE frame count, not waft_frames (which is
+    # skip_step-decimated; add_prompt uses native indices -- confirmed IndexError).
+    sam3_scale = float(os.environ.get("SPAG_SAM3_SCALE_DISABLE", "1.0"))
+    sam3_maxsize = int(os.environ.get("SPAG_SAM3_MAXSIZE", "0"))
     if sam3_maxsize > 0:
-        # Absolute cap on the longer edge instead of a relative scale factor:
-        # clips already below the cap (e.g. MattSwift at 2048px) pass through
-        # near-native, so thin/articulated subjects don't lose detail they
-        # didn't need to; only clips above the cap (e.g. CIELE at 3840px) get
-        # downscaled, and by more than a flat 0.5 would -- see B1 doc item 3
-        # for the mask-IoU evidence this targets (SPAG_SAM3_SCALE=0.5 hurt
-        # MattSwift/atelier_1 but not Dispo_RDV/scene01, no resolution
-        # correlation -- but MattSwift's post-scale resolution was the
-        # lowest of the four, hence the maxsize alternative).
-        # NOTE: must use meta['H']/meta['W'] (true native), not this function's
-        # `viz_frames` param -- that's actually the WAFT-scaled array (already
-        # capped to ~1024 on the long side by the caller), so every clip lands
-        # near the same WAFT cap regardless of native resolution. Using it here
-        # would make SPAG_SAM3_SCALE and SPAG_SAM3_MAXSIZE both anchor off a
-        # pre-shrunk shape -- confirmed empirically: SPAG_SAM3_SCALE=0.5 logs
-        # "downscaled to 512x256" for every one of MattSwift/atelier_1/scene01/
-        # Dispo_RDV despite native resolutions ranging 2048px-2560px, because
-        # the 0.5 factor is applied to the ~1024px WAFT shape, not native --
-        # the real native-to-SAM3 factor was 0.2-0.25x, not 0.5x.
+        # Absolute cap on the longer edge (not a relative scale): only clips above
+        # it get downscaled. Must use meta['H']/meta['W'] (true native), not
+        # `waft_frames` (~1024px cap) -- scaling off that anchored every clip to
+        # the same ~512x256 regardless of native res (confirmed bug, see B1 §3).
         native_long_edge = max(meta['H'], meta['W'])
         sam3_scale = min(1.0, sam3_maxsize / native_long_edge)
-    sam3_resource_path = str(video_path)
+    # Always build an in-memory PIL frame list, never pass `str(video_path)`
+    # directly: SAM3's path-based cv2 loader normalizes without dividing by 255
+    # first (~255x too-large pixel values); the list path does it correctly.
+    # Confirmed via repro: same "person" prompt found both people via list, only
+    # 1 via raw path.
     if sam3_scale < 1.0:
-        # Apply the factor to NATIVE dims, for the same reason the note above
-        # derives it from native: the frames being resized are decoded at native
-        # resolution below, and viz_frames is the WAFT-shrunk array (~1024 long
-        # side). Scaling viz_frames here would compose the two shrinks --
-        # effective res = viz_long * (maxsize / native_long), so a 3840px clip
-        # asking for 1536 actually got 408px.
+        # Apply to NATIVE dims (frames are decoded at native res below) --
+        # scaling waft_frames instead would compose the two shrinks, e.g. a
+        # 3840px clip asking for 1536 would actually get 408px.
         sW = max(int(meta['W'] * sam3_scale) & ~1, 2)
         sH = max(int(meta['H'] * sam3_scale) & ~1, 2)
-        cap = cv2.VideoCapture(str(video_path))
-        sam3_resource_path = []
-        while True:
-            ret, frame_bgr = cap.read()
-            if not ret:
-                break
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            sam3_resource_path.append(
-                Image.fromarray(cv2.resize(frame_rgb, (sW, sH), interpolation=cv2.INTER_AREA))
-            )
-        cap.release()
+    else:
+        sW, sH = meta['W'], meta['H']
+    cap = cv2.VideoCapture(str(video_path))
+    sam3_resource_path = []
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        if sam3_scale < 1.0:
+            frame_rgb = cv2.resize(frame_rgb, (sW, sH), interpolation=cv2.INTER_AREA)
+        sam3_resource_path.append(Image.fromarray(frame_rgb))
+    cap.release()
+    if sam3_scale < 1.0:
         _scale_src = f"SPAG_SAM3_MAXSIZE={sam3_maxsize}" if sam3_maxsize > 0 else f"SPAG_SAM3_SCALE={sam3_scale}"
         print(f"[SPAG4D] SAM3 segmentation pass downscaled to {sW}x{sH} ({_scale_src}, effective scale={sam3_scale:.3f}), {len(sam3_resource_path)} in-memory native-frame-count frames...")
+    else:
+        print(f"[SPAG4D] SAM3 segmentation pass at native resolution {sW}x{sH}, {len(sam3_resource_path)} in-memory frames...")
 
     # Start a session
     initial_response = video_predictor.handle_request(
@@ -2160,15 +2059,10 @@ def segment_with_flows(
         fg_mask = cv2.dilate(fg_mask, kernel_dilate, iterations=1)
 
         def _sample_extra_points(contour, x, y, w, h, n_bands: int = 4):
-            # A single centroid seeds SAM3 with only one point -- for an elongated
-            # object (a standing/prone person) that tends to grow a mask around
-            # whichever part is most salient near that point (e.g. torso) rather
-            # than the whole silhouette, even when the flow contour itself already
-            # spans the full body. Sample a few more real interior points across
-            # the contour's height bands (median foreground x per row) so SAM3
-            # gets positive prompts spread across head/torso/legs instead of just
-            # center-of-mass. Every point is verified inside the contour, never a
-            # synthetic box-geometry interpolation that could land on background.
+            # A single centroid tends to grow a mask around the most salient part
+            # (e.g. torso) for an elongated object rather than the whole body.
+            # Sample real interior points across height bands instead, all
+            # verified inside the contour (never a synthetic box interpolation).
             contour_mask = np.zeros((y + h, x + w), dtype=np.uint8)
             cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
             pts = []
@@ -2294,7 +2188,7 @@ def segment_with_flows(
         bounding_boxes = merged_boxes
 
         matched_this_frame = set()
-        visual_frame = viz_frames[frame_idx].copy()
+        visual_frame = waft_frames[frame_idx].copy()
         # Match found motion regions to existing tracks, or spawn new IDs (e.g., flyaway hat)
         for (cX, cY, x, y, w, h, conf, area, member_points) in current_frame_centers:
             matched_obj_id: int | None = None
@@ -2375,26 +2269,191 @@ def segment_with_flows(
     reencode_h264(str(output_path / 'boxes_input_sam.mp4'))
     print(f"-> Diagnostic preview saved: {output_path}")
 
-    # Occlusion gate (opt-in, SPAG_OCCL_FBGATE=1; goal.md Step 2): the flow-based
-    # tracker registers each object at its FIRST-seen frame. If that frame is an
-    # occlusion/disocclusion event, the flow (hence the box/points) is unreliable
-    # and SAM3 gets anchored onto a bad location -> track drift for the rest of the
-    # clip. The forward-backward consistency error (fb_consistency_error, already
-    # used inside propagate_depth_via_flow) spikes exactly there. When enabled, we
-    # pick each track's registration anchor as its first occurrence whose mean
-    # FB-error over the object's bbox is below `fb_gate_thresh` px, falling back to
-    # the plain first occurrence if every occurrence is occluded. flows_fwd/bwd are
-    # decimated-frame-indexed (s['idx']); bbox is in new_W/new_H space and rescaled
-    # to the fb_err map. Inert (byte-identical to before) when the flag is off or
-    # flows weren't passed.
+    # Cross-track de-dup: merge_gap_px above only fuses fragments WITHIN one
+    # frame; a hand/head blob that repeatedly detaches from the torso blob
+    # becomes two independent tracks instead (confirmed: MattSwift 2 people ->
+    # 4 obj_ids). Fold tracks whose boxes overlap heavily (by containment, not
+    # IoU -- nested boxes have low IoU) at most shared frames into one.
+    def _containment(b1, b2):
+        x1, y1, w1, h1 = b1
+        x2, y2, w2, h2 = b2
+        ix1, iy1 = max(x1, x2), max(y1, y2)
+        ix2, iy2 = min(x1 + w1, x2 + w2), min(y1 + h1, y2 + h2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        smaller = min(w1 * h1, w2 * h2)
+        return inter / smaller if smaller > 0 else 0.0
+
+    def _gap(b1, b2):
+        # Same edge-to-edge rect distance as _box_gap above (0 if overlapping).
+        x1, y1, w1, h1 = b1
+        x2, y2, w2, h2 = b2
+        dx = max(x1 - (x2 + w2), x2 - (x1 + w1), 0)
+        dy = max(y1 - (y2 + h2), y2 - (y1 + h1), 0)
+        return max(dx, dy)
+
+    def _size_ratio_ok(b1, b2, min_ratio):
+        # _containment (inter/smaller-area) and _gap (0 whenever boxes touch)
+        # are both blind to scale: a small box fully nested inside -- or merely
+        # touching -- a much larger one reads as a "duplicate" either way. That's
+        # correct for a real single-object fragment (a head box nested in its own
+        # wholebody box, comparable overall scale over the track's lifetime) but
+        # wrong for two genuinely distinct, differently-sized objects that happen
+        # to overlap (e.g. a "person" text detection sitting on/in a much larger
+        # "forklift" flow track) -- confirmed root cause of the forklift going
+        # untracked on circulation_site_1_edit_coupe: the driver's small person
+        # box "covered" (per containment/gap) the forklift's large flow box, so
+        # the flow-detected forklift track was discarded as an already-covered
+        # duplicate. Require comparable area before containment/gap can dedup.
+        a1 = max(0.0, b1[2]) * max(0.0, b1[3])
+        a2 = max(0.0, b2[2]) * max(0.0, b2[3])
+        if a1 <= 0 or a2 <= 0:
+            return False
+        return min(a1, a2) / max(a1, a2) >= min_ratio
+
+    # Fragments of ONE object are often spatially DISJOINT (why merge_gap_px
+    # failed): high containment is one dup signal, a small persistent GAP is
+    # the other (the one that fires on MattSwift). Flag on EITHER signal.
+    dup_gap_thresh = float(os.environ.get("SPAG_TRACK_DEDUP_GAP", "40"))
+    dup_overlap_thresh = float(os.environ.get("SPAG_TRACK_DEDUP_OVERLAP", "0.6"))
+    # Guards the text<->flow and text<->text coverage dedups below (NOT the
+    # track-vs-track fragment-fusion dedup a few lines down, which must keep
+    # fusing very differently-sized fragments of one real object, e.g. a head
+    # box and its own wholebody box). See _size_ratio_ok for the forklift/driver
+    # bug this closes.
+    dup_size_ratio_thresh = float(os.environ.get("SPAG_TRACK_DEDUP_SIZE_RATIO", "0.3"))
+    min_cooccur = int(os.environ.get("SPAG_TRACK_DEDUP_MIN_COOCCUR", "2"))
+    # Ghost tracks rarely share an EXACT frame index (matched_this_frame blocks
+    # both from claiming one frame, so they alternate). Match nearest-in-time
+    # occurrence within this many decimated-frame steps instead of idx equality.
+    idx_tolerance = int(os.environ.get("SPAG_TRACK_DEDUP_IDX_TOL", "3"))
+
+    n_tracks = len(active_tracks)
+    dedup_parent = list(range(n_tracks))
+
+    def _dedup_find(a):
+        while dedup_parent[a] != a:
+            dedup_parent[a] = dedup_parent[dedup_parent[a]]
+            a = dedup_parent[a]
+        return a
+
+    def _dedup_union(a, b):
+        ra, rb = _dedup_find(a), _dedup_find(b)
+        if ra != rb:
+            dedup_parent[ra] = rb
+
+    def _nearest_matches(occ_a, occ_b, tol):
+        # occ_a/occ_b: sorted list of (idx, box). For each occurrence in the
+        # shorter list, pair it with the closest-in-time occurrence in the
+        # other list if within `tol` decimated frames.
+        pairs = []
+        idxs_b = [o[0] for o in occ_b]
+        for idx_a, box_a in occ_a:
+            j = bisect.bisect_left(idxs_b, idx_a)
+            best = None
+            for cand in (j - 1, j):
+                if 0 <= cand < len(occ_b):
+                    d = abs(occ_b[cand][0] - idx_a)
+                    if d <= tol and (best is None or d < best[0]):
+                        best = (d, occ_b[cand][1])
+            if best is not None:
+                pairs.append((box_a, best[1]))
+        return pairs
+
+    for a in range(n_tracks):
+        occ_a = sorted((s['idx'], s['box']) for s in active_tracks[a]['seen'])
+        for b in range(a + 1, n_tracks):
+            occ_b = sorted((s['idx'], s['box']) for s in active_tracks[b]['seen'])
+            shorter, longer = (occ_a, occ_b) if len(occ_a) <= len(occ_b) else (occ_b, occ_a)
+            pairs = _nearest_matches(shorter, longer, idx_tolerance)
+            if len(pairs) < min_cooccur:
+                continue
+            mean_ov = sum(_containment(ba, bb) for ba, bb in pairs) / len(pairs)
+            mean_gap = sum(_gap(ba, bb) for ba, bb in pairs) / len(pairs)
+            if mean_ov >= dup_overlap_thresh or mean_gap <= dup_gap_thresh:
+                if os.environ.get("SPAG_TRACK_DEDUP_DEBUG", "0") == "1":
+                    print(f"[Track dedup][dbg] obj{active_tracks[a]['obj_id']} vs obj{active_tracks[b]['obj_id']}: "
+                          f"{len(pairs)} matched pairs, mean overlap={mean_ov:.3f}, mean gap={mean_gap:.1f}px -> DUP")
+                _dedup_union(a, b)
+
+    # Second signal: re-identification via anchor proximity. A track that
+    # drifts over its lifetime can miss the pass above even when its
+    # REGISTRATION anchor is coincident with another's (confirmed on
+    # MattSwift). Compare FIRST/LAST occurrences instead of whole trajectories,
+    # gated by a frame-gap cap so unrelated objects aren't fused.
+    reid_max_gap = int(os.environ.get("SPAG_TRACK_REID_MAX_GAP", "40"))
+    for a in range(n_tracks):
+        seen_a = sorted(active_tracks[a]['seen'], key=lambda s: s['idx'])
+        if not seen_a:
+            continue
+        anchors_a = [seen_a[0], seen_a[-1]]
+        for b in range(a + 1, n_tracks):
+            if _dedup_find(a) == _dedup_find(b):
+                continue
+            seen_b = sorted(active_tracks[b]['seen'], key=lambda s: s['idx'])
+            if not seen_b:
+                continue
+            anchors_b = [seen_b[0], seen_b[-1]]
+            for sa in anchors_a:
+                for sb in anchors_b:
+                    time_gap = abs(sa['idx'] - sb['idx'])
+                    if time_gap > reid_max_gap:
+                        continue
+                    spatial_gap = _gap(sa['box'], sb['box'])
+                    spatial_ov = _containment(sa['box'], sb['box'])
+                    if spatial_ov >= dup_overlap_thresh or spatial_gap <= dup_gap_thresh:
+                        if os.environ.get("SPAG_TRACK_DEDUP_DEBUG", "0") == "1":
+                            print(f"[Track dedup][dbg] obj{active_tracks[a]['obj_id']} <-> obj{active_tracks[b]['obj_id']}: "
+                                  f"reid anchor gap={time_gap} decimated frames, "
+                                  f"overlap={spatial_ov:.3f}, gap={spatial_gap:.1f}px -> DUP")
+                        _dedup_union(a, b)
+                        break
+                else:
+                    continue
+                break
+
+    dedup_groups: dict[int, list[int]] = {}
+    for idx in range(n_tracks):
+        dedup_groups.setdefault(_dedup_find(idx), []).append(idx)
+
+    deduped_tracks = []
+    for members in dedup_groups.values():
+        if len(members) == 1:
+            deduped_tracks.append(active_tracks[members[0]])
+            continue
+        members_sorted = sorted(members, key=lambda m: len(active_tracks[m]['seen']), reverse=True)
+        senior = active_tracks[members_sorted[0]]
+        seen_by_idx = {s['idx']: s for s in senior['seen']}
+        for m in members_sorted[1:]:
+            junior = active_tracks[m]
+            print(f"[Track dedup] Folding object {junior['obj_id']} into {senior['obj_id']} "
+                  f"({len(junior['seen'])} occurrences, mean overlap over shared frames)")
+            for s in junior['seen']:
+                fi = s['idx']
+                # On a frame both tracks share, keep whichever box is larger --
+                # the whole-body box is the more useful SAM3 prompt than the
+                # fragment's.
+                if fi not in seen_by_idx or (s['box'][2] * s['box'][3]) > (
+                    seen_by_idx[fi]['box'][2] * seen_by_idx[fi]['box'][3]
+                ):
+                    seen_by_idx[fi] = s
+        senior['seen'] = [seen_by_idx[k] for k in sorted(seen_by_idx)]
+        deduped_tracks.append(senior)
+    if len(deduped_tracks) < len(active_tracks):
+        print(f"[Track dedup] {len(active_tracks)} tracks -> {len(deduped_tracks)} after de-duplication")
+    active_tracks = deduped_tracks
+
+    # Occlusion gate (opt-in, SPAG_OCCL_FBGATE=1): if a track's first-seen frame
+    # is an occlusion event, flow is unreliable and SAM3 anchors badly -> drift.
+    # When enabled, anchor at the first occurrence whose FB-error is below
+    # `fb_gate_thresh`, falling back to the plain first occurrence otherwise.
     occl_fbgate = (
         os.environ.get("SPAG_OCCL_FBGATE", "0") == "1"
         and flows_fwd is not None and flows_bwd is not None
     )
-    # Default 3.0px: on the jam clip (trop_long_embouteillage) this is the win-only
-    # regime — recovers the two genuinely-occluded tracks (obj2 +797, obj17 +746
-    # present-frames) while the marginal 1.5px skips (obj3/4/14 collateral) snap back
-    # to baseline. Best net (+1198 present-frames, +5.4%). See D1 occlusion section.
+    # Default 3.0px: on trop_long_embouteillage this is the win-only regime --
+    # recovers the two genuinely-occluded tracks (+797/+746 present-frames) while
+    # marginal 1.5px skips snap back to baseline. Best net +1198 (+5.4%). See D1.
     fb_gate_thresh = float(os.environ.get("SPAG_OCCL_FB_THRESH", "3.0"))
     # Max occurrences a re-anchor may skip (cost cap; resolves the obj-1 caveat -- see
     # the gate body below for the mechanism).
@@ -2418,8 +2477,126 @@ def segment_with_flows(
         roi = fb[y0:y1, x0:x1]
         return float(roi.mean()) if roi.size else 0.0
 
+    # SAM3 text-prompt registration -- MUST run before flow-based point
+    # registration: text add_prompt resets session state, wiping objects
+    # already registered via points. Purpose: flow analysis misses standing
+    # people and fragments a moving person into separate obj_ids; text
+    # detection gives one box per person regardless of motion. Seeds points
+    # into the same path the flow loop uses so both propagate together below.
+
+    # Common subjects likely to appear and be worth tracking in an arbitrary
+    # video; kept short since each entry costs one extra SAM3 forward pass
+    # (see the two-phase note below) and a broad open-vocab prompt like
+    # "vehicle"/"animal" already covers most unlisted subclasses.
+    text_prompts = ["person", "dog", "cat", "car", "bicycle", "motorcycle", "animal", "vehicle", "forklift", "truck"]
+    text_obj_boxes: list[tuple[int, list[float]]] = []  # (obj_id, abs xywh box in meta['new_W']/new_H space)
+
+    def _points_from_mask(mask_np, n_bands: int = 4):
+        # Centroid + height-band medians over the FULL y-range, in [0,1]
+        # fractions of the mask's own shape. Bands must include y0/y1: a head
+        # sits at y0, and without a point there Phase-2 points-reregistration
+        # undersegments and drops it (repro on Dispo_RDV: mask top y=475 -> 601).
+        ys, xs = np.where(mask_np)
+        if len(xs) == 0:
+            return []
+        mh, mw = mask_np.shape[:2]
+        pts = [[float(xs.mean()) / mw, float(ys.mean()) / mh]]
+        y0, y1 = int(ys.min()), int(ys.max())
+        for i in range(n_bands + 1):
+            row_y = y0 + int((y1 - y0) * i / n_bands)
+            row_xs = xs[ys == row_y]
+            if len(row_xs) == 0:
+                continue
+            pts.append([float(np.median(row_xs)) / mw, float(row_y) / mh])
+        return pts
+
+    if text_prompts:
+        # Phase 1: run every text prompt FIRST, before registering any via
+        # points (each add_prompt resets state, so interleaving would wipe
+        # earlier registrations). bf16 autocast makes borderline detections
+        # flip run-to-run (process-level cudnn-autotune effect, confirmed on
+        # MattSwift), so retrying the same frame is a dead end -- sample a
+        # couple of DIFFERENT anchor frames and dedup by box position instead.
+        anchor_frames = sorted({0, min((n_total_frames // 2) * skip_step, max(0, n_total_frames * skip_step - 1))})
+        pending: list[tuple[str, list[float], list, int]] = []  # (prompt, box_abs, points, anchor_frame)
+
+        def _register_text_detections(prompt, out, n_det, anchor_frame):
+            # Dedup a NEW box only against entries pending BEFORE this call --
+            # detections from ONE call are already distinct per SAM3's own NMS
+            # and must not be folded together by dup_gap_thresh (tuned for
+            # merging fragments of a SINGLE object across flow tracks).
+            baseline = list(pending)
+            for i in range(n_det):
+                mask = out["out_binary_masks"][i]
+                mask_np = mask.cpu().numpy() if hasattr(mask, "cpu") else np.asarray(mask)
+                ys, xs = np.where(mask_np)
+                if len(xs) == 0:
+                    continue
+                mh, mw = mask_np.shape[:2]
+                x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+                # Scale the box up to meta['new_W']/new_H space (see
+                # _points_from_mask note above) so it's directly comparable
+                # to flow track boxes (s['box']) for the IoU dedup below.
+                sx, sy = meta['new_W'] / mw, meta['new_H'] / mh
+                box_abs = [x0 * sx, y0 * sy, (x1 - x0) * sx, (y1 - y0) * sy]
+                points = _points_from_mask(mask_np)
+                if not points:
+                    continue
+                # Dedup against everything pending BEFORE this call -- catches
+                # both overlapping vocab (e.g. "dog" and "animal" firing on
+                # the same instance) and repeat detections of the same
+                # instance across retries of the same prompt.
+                dup = next(
+                    (p for _pr, p, _pts, _af in baseline
+                     if _size_ratio_ok(box_abs, p, dup_size_ratio_thresh)
+                     and (_containment(box_abs, p) >= dup_overlap_thresh or _gap(box_abs, p) <= dup_gap_thresh)),
+                    None,
+                )
+                if dup is not None:
+                    continue
+                pending.append((prompt, box_abs, points, anchor_frame))
+
+        for anchor_frame in anchor_frames:
+            for prompt in text_prompts:
+                resp = video_predictor.handle_request(
+                    request=dict(
+                        type="add_prompt",
+                        session_id=session_id,
+                        frame_index=anchor_frame,
+                        text=prompt,
+                    )
+                )
+                out = resp["outputs"]
+                n_det = len(out.get("out_obj_ids", []))
+                if n_det == 0:
+                    print(f"[By text] no '{prompt}' detections at frame {anchor_frame}", flush=True)
+                    continue
+                _register_text_detections(prompt, out, n_det, anchor_frame)
+
+        # Phase 2: register every pending detection via points now that all
+        # text resets are done. None of these calls reset state.
+        for prompt, box_abs, points, anchor_frame in pending:
+            obj_id = next_available_obj_id
+            next_available_obj_id += 1
+            point_labels = [1] * len(points)
+            tqdm.write(f"[By text] '{prompt}' object {obj_id} registered at frame {anchor_frame} (box={[round(v) for v in box_abs]})")
+            video_predictor.handle_request(
+                request=dict(
+                    type="add_prompt",
+                    session_id=session_id,
+                    frame_index=anchor_frame,
+                    obj_id=obj_id,
+                    points=points,
+                    point_labels=point_labels,
+                )
+            )
+            text_obj_boxes.append((obj_id, box_abs))
+            if start_frame_index is None:
+                start_frame_index = anchor_frame
+
     registered_anchor_frames: list = []
-    found_object = len(active_tracks)
+    found_object = len(active_tracks) + len(text_obj_boxes)
+    text_covered_ids: set = set()
     for track in active_tracks:
         seens = track['seen']
         if len(seens) < min_times_seen:
@@ -2427,6 +2604,20 @@ def segment_with_flows(
             found_object -= 1
             # active_tracks.remove(track)
             continue
+
+        if text_obj_boxes:
+            first_box = seens[0]['box']
+            covered = next(
+                (tid for tid, tbox in text_obj_boxes
+                 if _size_ratio_ok(first_box, tbox, dup_size_ratio_thresh)
+                 and (_containment(first_box, tbox) >= dup_overlap_thresh or _gap(first_box, tbox) <= dup_gap_thresh)),
+                None,
+            )
+            if covered is not None:
+                print(f"Skip object {track['obj_id']} because text-prompt object {covered} already covers it", flush=True)
+                found_object -= 1
+                text_covered_ids.add(track['obj_id'])
+                continue
 
         if occl_fbgate:
             # Reorder so the first non-occluded occurrence is the registration
@@ -2439,18 +2630,10 @@ def segment_with_flows(
             clean = [s for s, e in zip(seens, errs) if e < fb_gate_thresh]
             if clean and clean[0] is not seens[0]:
                 skipped = seens.index(clean[0])
-                # Second signal (resolves the obj-1 caveat): re-anchoring DISCARDS every
-                # occurrence before the clean one, so its cost is exactly those skipped
-                # good frames. A genuinely occluded object is poorly detected during the
-                # occlusion (obj17: 0 detections before it emerges at f432, then clean in
-                # 5 occ), so its clean anchor is only a few occurrences in. An object that
-                # is *well tracked but has noisy local flow* (obj1: 16 dense detections
-                # f0..f88, FB-err 10-20 but continuously segmented) racks up many skipped
-                # occurrences -- re-anchoring it throws away real coverage. FB-error alone
-                # can't tell these apart (obj1's chosen anchor reads clean at 1.84px); the
-                # skip count can. Cap it: only re-anchor when the clean anchor is within
-                # SPAG_OCCL_MAX_SKIP (default 8) occurrences of the first. obj2/6 (skip 2)
-                # and obj17 (skip 5) still re-anchor; obj1 (skip 16) no longer does.
+                # Second signal: re-anchoring DISCARDS every occurrence before the
+                # clean one. A well-tracked-but-noisy object racks up many skipped
+                # occurrences (real coverage lost); FB-error alone can't tell that
+                # apart from genuine occlusion, so cap the skip (SPAG_OCCL_MAX_SKIP).
                 if skipped > max_reanchor_skip:
                     if os.environ.get("SPAG_OCCL_DEBUG", "0") == "1":
                         tqdm.write(f"[Occl gate] object {track['obj_id']}: first occurrence "
@@ -2505,57 +2688,47 @@ def segment_with_flows(
     if occl_fbgate and registered_anchor_frames:
         start_frame_index = min(registered_anchor_frames)
 
-    # Text prompts also
-    # prompts = ["person", "animal", "vehicle", "ball", "balloon", "gun", "pet", "car", "bus"]
-    # n = 0
-    # for p in prompts:
-    #     frame_response = video_predictor.handle_request(
-    #         request=dict(
-    #             type="add_prompt",
-    #             session_id=session_id,  # Uses the permanent ID variable
-    #             frame_index=start_frame_index,
-    #             text=p,
-    #         )
-    #     )
-    #     # Safely get length of probabilities array if it exists
-    #     out = frame_response.get("outputs", None)
-    #     m = len(out.get("out_probs", [])) if out is not None else 0
-    #     n += m
-    #     if m > 0:
-    #         print(f"[By prompt] registered [{m} {p}]")
-
-    #     found_object += n
-
     # STEP B: Propagate All Interleaved Multi-Object Tracks
     print(f"\n--- Propagating {found_object} moving object starting at {start_frame_index} ---")
 
-    # Combined preview: motion-detection mask (left) and per-object SAM3 masks
-    # with ID boxes (right), concatenated into one video instead of two separate files.
+    # Combined preview: motion-detection binary mask (top) and the colored ID
+    # mask alpha-blended over the real source frame (bottom) -- previously only
+    # produced post-hoc in build_medias.py's build_mask_vs_source() via an
+    # ffmpeg colorkey overlay; now baked directly into the main run so every
+    # clip gets it for free.
     mask_writer = cv2.VideoWriter(
         str(output_path / 'sam3_masks_preview.mp4'), fourcc, meta['fps'],
         (meta['new_W'], meta['new_H'] * 2),
     )
     np.random.seed(42)  # Pour garder les mêmes couleurs d'une frame à l'autre
-    STATIC_COLORS = np.random.randint(0, 255, size=(found_object, 3), dtype=np.uint8)
+    _colored_flow_tracks = [
+        t for t in active_tracks
+        if len(t['seen']) >= min_times_seen and t['obj_id'] not in text_covered_ids
+    ]
+    STATIC_COLORS = np.random.randint(0, 255, size=(max(1, len(_colored_flow_tracks) + len(text_obj_boxes)), 3), dtype=np.uint8)
     color_map = {
         track['obj_id']: STATIC_COLORS[i].tolist()
-        for i, track in enumerate(t for t in active_tracks if len(t['seen']) >= min_times_seen)
+        for i, track in enumerate(_colored_flow_tracks)
     }
+    color_map.update({
+        obj_id: STATIC_COLORS[len(color_map) + i].tolist()
+        for i, (obj_id, _box) in enumerate(text_obj_boxes)
+    })
 
     outputs_per_frame = {}
+    # propagate_in_video("both") streams responses in traversal order (forward
+    # then backward from start_frame_index), not ascending native-frame order --
+    # writing straight to mask_writer as responses arrive puts the preview mp4's
+    # frames out of temporal order, so overlaying it against the (correctly
+    # ordered) source video in build_medias.py shows a growing shift/offset.
+    # Buffer by native frame_idx and flush to the writer in sorted order instead.
+    mask_frames_by_idx = {}
 
     def _reseed_window(anchor_idx, target_idx):
-        # Tier 4.2 chunking: a fresh propagate_in_video call on the same
-        # session does NOT reliably continue tracking an already-registered
-        # object -- confirmed via a real debug run (SPAG_SAM3_MAX_FRAMES=20 on
-        # a 75-frame clip) that showed the first frame of windows 3 and 4 came
-        # back with an EMPTY mask, i.e. the object was silently lost at the
-        # window boundary even though every frame index still got an
-        # `outputs_per_frame` entry (coverage counting alone can't catch
-        # this). Re-prompt each object explicitly at the new window's start
-        # using a centroid point derived from its last known (non-empty) mask
-        # at `anchor_idx`, so propagate_in_video has something real to
-        # continue from instead of silently dropping the object.
+        # Tier 4.2 chunking: a fresh propagate_in_video call on the same session
+        # does NOT reliably continue tracking a registered object -- confirmed
+        # via debug run, object silently lost at window boundaries. Re-prompt
+        # each object with a centroid from its last non-empty mask instead.
         anchor_out = outputs_per_frame.get(anchor_idx)
         if anchor_out is None:
             return
@@ -2614,24 +2787,37 @@ def segment_with_flows(
             h_pixel = int(boxes_xyhw[3] * meta['new_H'])
             cv2.rectangle(separated_mask, (x_pixel, y_pixel), (x_pixel + w_pixel, y_pixel + h_pixel), color, 2)
             cv2.putText(separated_mask, f"ID:{obj_id}", (x_pixel, y_pixel - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        # Save combined black-and-white mask + per-object mask side-by-side
+        # Bottom panel: colored ID mask alpha-blended over the real source frame,
+        # so coverage can be checked directly against the actual clip instead of
+        # a bare mask. waft_frames is already (new_H, new_W)-sized and BGR, and
+        # indexed by DECIMATED (skip_step) index; frame_idx here is native.
+        src_frame = waft_frames[min(frame_idx // skip_step, len(waft_frames) - 1)]
+        if src_frame.shape[:2] != (meta['new_H'], meta['new_W']):
+            src_frame = cv2.resize(src_frame, (meta['new_W'], meta['new_H']))
+        has_mask = np.any(separated_mask != 0, axis=-1)
+        overlay_frame = src_frame.copy()
+        alpha = 0.6
+        overlay_frame[has_mask] = (
+            (1 - alpha) * src_frame[has_mask].astype(np.float32)
+            + alpha * separated_mask[has_mask].astype(np.float32)
+        ).astype(np.uint8)
+
+        # Save combined black-and-white mask + source overlay stacked
         combined_frame = np.concatenate(
-            [np.stack([accumulated_mask] * 3, axis=-1), separated_mask], axis=0
+            [np.stack([accumulated_mask] * 3, axis=-1), overlay_frame], axis=0
         )
-        mask_writer.write(combined_frame)
+        mask_frames_by_idx[frame_idx] = combined_frame
         return frame_idx
 
     # Tier 4.2 (opt-in, SPAG_SAM3_MAX_FRAMES=<int>): bound per-call VRAM/memory-bank
     # growth by chunking propagate_in_video into successive windows instead of one
     # unbounded "both" call. A single capped call leaves every frame outside the
-    # cap's reach with NO SAM3 output at all (confirmed: on a 75-frame test clip,
-    # cap=20 covered only 23/38 sampled frames -- the other 68% got no real
-    # tracking). Chunking re-issues propagate_in_video repeatedly on the SAME
-    # session (so the model's memory bank / tracked-object state carries over),
-    # each call bounded to max_frame_num_to_track, walking forward from
-    # start_frame_index to the last needed native frame and backward from
-    # start_frame_index to 0 -- covering every needed frame with real tracking
-    # while still bounding how many frames are attended to per single call.
+    # cap's reach with NO SAM3 output (confirmed: 75-frame test clip, cap=20
+    # covered only 23/38 sampled frames). Chunking re-issues propagate_in_video
+    # repeatedly on the SAME session (memory bank / tracked-object state carries
+    # over), each call bounded to max_frame_num_to_track, walking forward from
+    # start_frame_index to the last needed frame and backward to 0 -- covering
+    # every needed frame with real tracking while bounding per-call attention.
     _max_frames_env = os.environ.get("SPAG_SAM3_MAX_FRAMES")
     try:
         if _max_frames_env:
@@ -2700,6 +2886,8 @@ def segment_with_flows(
                     if fi not in outputs_per_frame:
                         nearest = min(covered, key=lambda c: abs(c - fi))
                         outputs_per_frame[fi] = outputs_per_frame[nearest]
+                        if nearest in mask_frames_by_idx:
+                            mask_frames_by_idx[fi] = mask_frames_by_idx[nearest]
         else:
             propagate_request = dict(
                 type="propagate_in_video",
@@ -2717,14 +2905,11 @@ def segment_with_flows(
         # Tier 4.3 (SPAG_SAM3_SCALE<1.0): masks come back at the downscaled
         # SAM3 input resolution, but downstream (run_video's per-frame depth
         # loop) fuses them against the OUTER-SCOPE, full-native-resolution
-        # `viz_frames` array (meta['H'], meta['W']) -- NOT this function's own
-        # `viz_frames` parameter (which is actually the WAFT-scaled,
-        # max-1024-side array the caller confusingly passes in under the same
-        # name, already capped by meta['new_H']/new_W), and NOT
-        # meta['new_H']/new_W either (that's the WAFT/mask working
-        # resolution, a different knob from the true native size). Confirmed
-        # by two real crashes against each wrong target before landing on the
-        # actual native meta['H']/meta['W']. Upsample every mask there.
+        # `viz_frames` array (meta['H'], meta['W']) -- not this function's own
+        # `waft_frames` param (WAFT-scaled) and not meta['new_H']/new_W (the
+        # WAFT/mask working resolution, a different knob). Confirmed by two
+        # real crashes against each wrong target before landing on native
+        # meta['H']/meta['W']. Upsample every mask there.
         _native_H, _native_W = meta['H'], meta['W']
         for _frame_idx, _obj_masks in outputs_per_frame.items():
             for _obj_id, _mask in list(_obj_masks.items()):
@@ -2750,7 +2935,10 @@ def segment_with_flows(
         )
         video_predictor.shutdown()
 
-        # Close writer
+        # Flush buffered preview frames in ascending native-frame order (see
+        # mask_frames_by_idx comment above) before closing the writer.
+        for _fi in sorted(mask_frames_by_idx):
+            mask_writer.write(mask_frames_by_idx[_fi])
         mask_writer.release()
         reencode_h264(str(output_path / 'sam3_masks_preview.mp4'))
 
@@ -2869,14 +3057,11 @@ def segment_with_sam(
     outputs_per_frame = {}
     # Tier 4.2 (opt-in, SPAG_SAM3_MAX_FRAMES=<int>): see segment_with_flows for
     # the full rationale. Unlike segment_with_flows, this function's default
-    # propagate call is unidirectional forward from `frame_idx` (no
-    # propagation_direction / start_frame_index override), so chunking here is
-    # forward-only: repeatedly call propagate_in_video on the SAME session,
-    # each bounded to max_frame_num_to_track, walking forward until every
-    # native frame index this function's own convention needs (idx * skip_step
-    # for idx in range(n_total_frames), n_total_frames being the post-skip_step
-    # count) is actually tracked, instead of leaving everything past a single
-    # capped call with NO SAM3 output.
+    # propagate call is unidirectional forward from `frame_idx`, so chunking
+    # here is forward-only: repeatedly call propagate_in_video on the SAME
+    # session, each bounded to max_frame_num_to_track, walking forward until
+    # every needed native frame index (idx * skip_step) is actually tracked,
+    # instead of leaving everything past a single capped call with no output.
     _max_frames_env = os.environ.get("SPAG_SAM3_MAX_FRAMES")
     needed = [idx * skip_step for idx in range(n_total_frames)]
     native_last_needed = needed[-1] if needed else 0
