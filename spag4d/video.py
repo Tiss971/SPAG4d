@@ -357,6 +357,7 @@ def run_video(
     activity_std_threshold: float = 10.0,
     skip_step: int = 10,
     freeze_bg: bool = False,
+    freeze_bg_live_color: bool = True,
     depth_min: float | None = None,
     depth_max: float | None = None,
     sky_threshold: float | None = None,
@@ -405,6 +406,20 @@ def run_video(
             flow-propagated object depth — validated to cut background
             temporal std ~1000x vs 'affine' with lower foreground flicker too.
             'affine' keeps the legacy per-frame affine-alignment behavior.
+        freeze_bg_live_color : default True (only takes effect with
+            freeze_bg=True, otherwise a no-op). The frozen background
+            layer's GEOMETRY still comes from the one-time temporal-median
+            build (gaussians_bg), but its COLOR is refreshed every frame
+            from the live image wherever that background pixel is
+            currently visible (sam_mask==0), falling back to the frozen
+            median color where a dynamic object currently covers it.
+            Fixes frozen_bg's dead appearance on shadows/screens without
+            reintroducing bglock-alone's trailing-edge occlusion holes.
+            Validated 2026-08-21 on circulation_site_1_edit_coupe (ground
+            shadows) and boutique1_HQ (flat screens, mixed SAM-tracked/
+            untracked): background block color drifts frame-to-frame as
+            intended while frozen_bg alone stays byte-identical, at
+            ~0-40s / ~250-300MB VRAM overhead.
         depth_npy_dir : optional directory to dump the raw per-frame metric
             depth map (the exact array passed to to_gaussians, i.e. after
             alignment/bglock compositing/freeze_bg masking) as float32 .npy,
@@ -432,6 +447,8 @@ def run_video(
 
     if depth_correction not in ("affine", "bglock"):
         raise ValueError(f"depth_correction must be 'affine' or 'bglock', got {depth_correction!r}")
+    if freeze_bg_live_color and not freeze_bg:
+        raise ValueError("freeze_bg_live_color requires freeze_bg=True (it only refreshes the frozen background layer's color)")
     if depth_correction == "bglock" and alignement_mask not in ("sam", "sam_and_activity"):
         raise ValueError(
             "depth_correction='bglock' requires a real dynamic mask: "
@@ -1468,7 +1485,26 @@ def run_video(
             sparse_pruning,
         )
         if freeze_bg:
-            gaussians = {k: torch.cat([gaussians_bg[k], gaussians[k]], dim=0) for k in gaussians_bg}
+            bg_frame = gaussians_bg
+            if freeze_bg_live_color and gaussians_bg["means"].shape[0] > 0:
+                # Geometry stays frozen (gaussians_bg["means"/"scales"/"quats"]
+                # never change); only re-sample color at each bg Gaussian's
+                # stored pixel_idx from the current frame's live image, where
+                # that pixel is currently visible (sam_mask==0). Pixels
+                # currently covered by a dynamic object keep the frozen
+                # median color -- there's no live appearance to sample there.
+                img_f = image_tensor.float()
+                if image_tensor.dtype == torch.uint8:
+                    img_f = img_f / 255.0
+                flat_img = img_f.reshape(-1, 3)
+                pixel_idx = gaussians_bg["pixel_idx"].to(flat_img.device)
+                visible_flat = torch.from_numpy((sam_mask == 0).reshape(-1)).to(flat_img.device)
+                visible_at_bg = visible_flat[pixel_idx]
+                bg_colors = gaussians_bg["colors"].clone()
+                bg_colors[visible_at_bg] = flat_img[pixel_idx[visible_at_bg]]
+                bg_frame = dict(gaussians_bg)
+                bg_frame["colors"] = bg_colors
+            gaussians = {k: torch.cat([bg_frame[k], gaussians[k]], dim=0) for k in bg_frame}
         colors_linear = False
         gs_generation_cumtime += time.time() - start_depth
 
@@ -1646,7 +1682,7 @@ def run_video(
     )
 
 
-# §4.3 (benchmarks/T1_T2_P0_AUDIT.md): DA360 disparity near zero inverts to ~1e6
+# §10.2 (benchmarks/bglock_open_questions.md): DA360 disparity near zero inverts to ~1e6
 # (sky/poles), and PaGeR clamps to exactly 200.0 — both pass depth>0 & isfinite, so
 # without this they silently enter the affine fit and pull scale/shift toward
 # nonsense. Neither backend declares a proper validity mask (§10.1), so this is a

@@ -11,13 +11,13 @@ correction is needed in the PLY export path.
 """
 
 import math
+from dataclasses import dataclass
+
 import numpy as np
 import torch
-from dataclasses import dataclass
-from typing import Optional
 
+from .scene_filter import SkyMode, filter_gaussian_candidates
 from .spherical_grid import create_spherical_grid, rotation_matrix_to_quaternion
-from .scene_filter import filter_gaussian_candidates, SkyMode
 
 
 @dataclass
@@ -37,8 +37,8 @@ class SPAGParams:
 def depth_to_gaussians(
     erp_image: torch.Tensor,
     depth_map: torch.Tensor,
-    params: Optional[SPAGParams] = None,
-    device: Optional[torch.device] = None,
+    params: SPAGParams | None = None,
+    device: torch.device | None = None,
 ) -> dict:
     """
     Convert ERP depth map + image into Gaussian splat parameters.
@@ -51,7 +51,11 @@ def depth_to_gaussians(
 
     Returns:
         Dict with keys: means [N,3], scales [N,3], quats [N,4] (XYZW),
-        colors [N,3] (sRGB 0-1), opacities [N,1]
+        colors [N,3] (sRGB 0-1), opacities [N,1], pixel_idx [N] (int64,
+        flat row*W+col index into the original H x W depth/image grid --
+        survives the scene_filter prune chain since it keys off the same
+        generic dict-of-tensors pattern, used to re-sample live per-frame
+        color onto a frozen-geometry background layer)
     """
     if params is None:
         params = SPAGParams()
@@ -134,10 +138,15 @@ def depth_to_gaussians(
 
     colors = img_for_sample[pixel_rows.cpu(), pixel_cols.cpu()].to(device)  # [N, 3]
 
+    # Flat pixel index into the original H x W grid, kept alongside the
+    # Gaussian params so it survives prune_outliers/prune_grazing_angle/
+    # prune_sparse_regions (all generic over gaussians.items()).
+    pixel_idx = (pixel_rows * W + pixel_cols).to(torch.int64)  # [N]
+
     # ── 6. Scales: latitude-aware anisotropic ──
     # Angular spacing between grid samples
     angular_spacing = math.pi / H  # radians per pixel row
-    base_scale = depth_sampled * angular_spacing * stride  # [N]
+    base_scale = depth_sampled * angular_spacing * stride # [N]
 
     # Latitude correction: sin(phi) shrinks scale near poles
     phi = grid.phi[rows, cols]  # [N]
@@ -169,6 +178,7 @@ def depth_to_gaussians(
         'quats': quats,
         'colors': colors,
         'opacities': opacities,
+        'pixel_idx': pixel_idx,
     }
 
 
@@ -180,4 +190,5 @@ def _empty_gaussians(device: torch.device) -> dict:
         'quats': torch.zeros(0, 4, device=device),
         'colors': torch.zeros(0, 3, device=device),
         'opacities': torch.zeros(0, 1, device=device),
+        'pixel_idx': torch.zeros(0, dtype=torch.int64, device=device),
     }
