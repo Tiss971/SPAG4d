@@ -85,7 +85,8 @@ def depth_to_gaussians(
         sky_mode=SkyMode.SKIP,
         pole_thinning=params.pole_thinning,
         depth_min=params.depth_min,
-        depth_max=params.depth_max if params.sky_threshold <= 0 else params.sky_threshold,
+        depth_max=params.depth_max,
+        sky_threshold=None if params.sky_threshold <= 0 else params.sky_threshold,
         sky_detection=params.sky_detection,
         min_density_ratio=params.min_density_ratio,
     )

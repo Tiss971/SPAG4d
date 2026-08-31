@@ -27,6 +27,7 @@ from .flow_depth_propagation import (
     composite_bg_locked_torch,
     compute_bidirectional_flow,
     fb_consistency_error,
+    feather_dynamic_mask,
     propagate_depth_via_flow,
     propagate_depth_via_flow_torch,
     upscale_flow,
@@ -238,7 +239,7 @@ def to_gaussians(
     depth_min: float | None = None,
     depth_max: float | None = None,
     sky_threshold: float | None = None,
-    outlier_pruning: float = 0.3,
+    outlier_pruning: float = 0.1,
     grazing_angle: float = 85.0,  # 65.0,
     sparse_pruning: float = 0.1,  # 0.3,
 ):
@@ -360,7 +361,7 @@ def run_video(
     depth_max: float | None = None,
     sky_threshold: float | None = None,
     stride: int = 8,
-    outlier_pruning: float = 0.1, # 0.3,
+    outlier_pruning: float = 0.1,
     grazing_angle: float = 85.0,  # 65.0,
     global_scale: float = 1.0,
     sparse_pruning: float = 0.1,  # 0.3,
@@ -420,6 +421,15 @@ def run_video(
             HxWx2 float32, native res, for idx>=1) for downstream velocity
             supervision -- see .claude/D1_FUTURE_WORK_PLAN.md.
     """
+    # fix #3 (docs/BGLOCK_MASKSCOPE_FIX2_APPLYEVERYWHERE.md "Next steps"): let
+    # bg_lock_dilate_px/bg_lock_feather_px be retuned without a code edit, since
+    # neither had a CLI/env knob before. Caller-supplied kwargs still win; env
+    # only overrides the function defaults (12/9) when the caller left them unset.
+    if bg_lock_dilate_px == 12 and os.environ.get("SPAG_BGLOCK_DILATE_PX"):
+        bg_lock_dilate_px = int(os.environ["SPAG_BGLOCK_DILATE_PX"])
+    if bg_lock_feather_px == 9 and os.environ.get("SPAG_BGLOCK_FEATHER_PX"):
+        bg_lock_feather_px = int(os.environ["SPAG_BGLOCK_FEATHER_PX"])
+
     if depth_correction not in ("affine", "bglock"):
         raise ValueError(f"depth_correction must be 'affine' or 'bglock', got {depth_correction!r}")
     if depth_correction == "bglock" and alignement_mask not in ("sam", "sam_and_activity"):
@@ -953,15 +963,33 @@ def run_video(
                 med = (lo + hi) / 2.0
             return med.to(depth.dtype)
 
+    # Under bglock the smoother's output only survives where the composite alpha > 0
+    # (inside the SAM mask + feather band); background pixels are overwritten by
+    # depth_ref regardless. So it cannot stabilize the background here, and its only
+    # remaining effect is smearing the moving silhouette: the per-pixel median over a
+    # causal window resolves to the *background* depth for pixels the subject has just
+    # moved onto, writing a ramp of background-depth splats inside the mask.
+    _smoothing_active = depth_smoothing and depth_correction != "bglock"
     depth_smoother = (
         TemporalDepthSmoother(depth_smoothing_window, depth_smoothing_method)
-        if depth_smoothing
+        if _smoothing_active
         else None
     )
+    if depth_smoothing and not _smoothing_active:
+        print("[SPAG4D] depth_smoothing disabled under depth_correction=bglock "
+              "(cannot affect the locked background; smears dynamic-object edges)")
 
     depth_prev_final = None  # bg-locked mode: previous frame's composited depth, warped forward each step
+    # SPAG_BGLOCK_NOFLOW=1: skip flow-propagation for the dynamic-object depth entirely.
+    # Instead of warping depth_prev_final along the WAFT flow field, just blend the
+    # previous frame's composited depth with this frame's own affine-aligned depth,
+    # pixel-for-pixel (no per-pixel correspondence). Tests whether the object-depth
+    # halo/ramp traced to DA360's own resolution limit (see docs/ da360 halo investigation,
+    # 2026-08-20) is made worse by flow-warp interpolation, or is unaffected by it.
+    _bglock_noflow = os.environ.get("SPAG_BGLOCK_NOFLOW", "0") == "1"
+    _bglock_noflow_blend = float(os.environ.get("SPAG_BGLOCK_NOFLOW_BLEND", "0.5"))
     # Confidence decay now compounds over an age field warped along the flow
-    # (docs/T1_T2_P0_AUDIT.md §4.1/§4.2). SPAG_CONF_DECAY / SPAG_CONF_FLOOR expose
+    # (benchmarks/bglock_open_questions.md §4.1/§4.2). SPAG_CONF_DECAY / SPAG_CONF_FLOOR expose
     # the two constants for sweeping; SPAG_CONF_LEGACY=1 restores the pre-2026-08-17
     # non-compounding behaviour every benchmark before that date was measured under.
     flow_state = PropagationState(
@@ -1174,9 +1202,37 @@ def run_video(
             depth_np[_valid_metric_mask(depth_np, fused_mask > 0, metrics_outlier_cap)]
         )))
         diag_out = {} if diag_writer is not None else None
+        # Fix #2 (bglock silhouette-bleed): under bglock every static pixel is
+        # overwritten by depth_ref in the composite regardless of what the
+        # affine correction wrote there (alpha≈0 -> locked), so it's cheaper
+        # and equally correct to apply (s, t) to the WHOLE frame rather than
+        # try to compute the exact composite footprint (dilate+feather of
+        # lock_mask, already computed once inside composite_bg_locked — no
+        # need to pay for it twice). The one thing that still needs the ring:
+        # the FIT must not be biased by DA360 edge-bleed on the pixels just
+        # outside fused_mask that the dilated mask will later blend in, so we
+        # widen the fit-exclusion (not the correction-mask param's original
+        # apply role) to also exclude that ring. Measured real: ~1/3 of the
+        # composite footprint sits outside fused_mask on this clip (frame 160:
+        # 34.6k / 95.0k px). Confirmed via SPAG_DIAG_CSV that widening the
+        # *application* alone doesn't move depth_delta_feather — that
+        # instability is local per-pixel noise near object edges, not a
+        # missing global correction, so apply_everywhere is strictly a
+        # cost/simplicity win here, not a behavior regression.
+        fit_exclude_ring = None
+        fit_exclude_ring_t = None
+        apply_everywhere = depth_correction == "bglock" and alignement_mask != "nothing"
+        if apply_everywhere:
+            feather_alpha = feather_dynamic_mask(lock_mask, bg_lock_dilate_px, bg_lock_feather_px)
+            fit_exclude_ring = (feather_alpha > 0.02).astype(np.uint8)
+            if gpu_depth_chain:
+                fit_exclude_ring_t = torch.from_numpy(fit_exclude_ring).to("cuda")
         if gpu_depth_chain:
             # align + smoothing on the GPU (depth is already a cuda tensor)
-            aligned_t = align_depth_frame_gpu(depth, depth_ref_t, fused_t, diag_out=diag_out)
+            aligned_t = align_depth_frame_gpu(
+                depth, depth_ref_t, fused_t, diag_out=diag_out,
+                correction_mask=fit_exclude_ring_t, apply_everywhere=apply_everywhere,
+            )
             if depth_smoother is not None:
                 aligned_t = depth_smoother.call_torch(aligned_t)
             aligned_depth_np = aligned_t.cpu().numpy()
@@ -1186,7 +1242,8 @@ def run_video(
                 aligned_depth_np = depth_np
             else:
                 aligned_depth_np = align_depth_frame(
-                    depth_np, depth_ref_np, fused_mask, alignement_method, verbose=True, diag_out=diag_out
+                    depth_np, depth_ref_np, fused_mask, alignement_method, verbose=True, diag_out=diag_out,
+                    correction_mask=fit_exclude_ring, apply_everywhere=apply_everywhere,
                 ).copy()
             # Solution 1: temporal depth smoothing (causal window) on the aligned
             # depth, applied before FG stabilization / bg-locked compositing / GS.
@@ -1229,6 +1286,18 @@ def run_video(
                 depth_object = aligned_depth_np.copy()
                 if gpu_composite:
                     depth_object_t = aligned_t
+            elif _bglock_noflow:
+                if gpu_depth_chain:
+                    depth_object_t = (
+                        (1.0 - _bglock_noflow_blend) * depth_prev_t
+                        + _bglock_noflow_blend * aligned_t
+                    )
+                    depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
+                else:
+                    depth_object = (
+                        (1.0 - _bglock_noflow_blend) * depth_prev_final
+                        + _bglock_noflow_blend * aligned_depth_np
+                    )
             elif gpu_depth_chain:
                 flow_fwd_t = torch.from_numpy(flows_fwd[idx - 1]).to("cuda")
                 flow_bwd_t = torch.from_numpy(flows_bwd[idx - 1]).to("cuda")
@@ -1652,6 +1721,12 @@ def align_depth_frame(
         & (depth_frame < outlier_cap)  # §4.3: excludes backend outliers from the fit
         & (depth_ref < outlier_cap)
     )
+    if correction_mask is not None:
+        # Keep the composite-footprint ring out of the FIT — it's a
+        # mask-transition band (DA360 edge-bleed near a moving object), not a
+        # trustworthy static sample, even though under bglock the correction
+        # itself gets applied everywhere (see apply_everywhere / step 6).
+        static_mask &= correction_mask == 0
 
     n_static = np.sum(static_mask)
     if n_static < min_static_pixels:
@@ -1724,8 +1799,11 @@ def align_depth_frame(
         diag_out["resid_full"] = np.abs(depth_ref - (s * depth_frame + t))
         diag_out["static_mask"] = static_mask
 
-    # ── 6. Application hors mask statique───────────────────────────────────
-    depth_frame[~static_mask] = s * depth_frame[~static_mask] + t
+    # ── 6. Application hors mask statique (ou partout si apply_everywhere,
+    # sûr sous bglock où la compositing verrouille de toute façon le fond au
+    # depth_ref là où le mask est nul) ──────────────────────────────────────
+    apply_mask = np.ones_like(static_mask) if apply_everywhere else ~static_mask
+    depth_frame[apply_mask] = s * depth_frame[apply_mask] + t
 
     return np.clip(depth_frame, 0.0, None)
 
@@ -1737,6 +1815,8 @@ def align_depth_frame_gpu(
     min_static_pixels: int = 100,
     scale_clip: tuple = (0.5, 2.0),
     diag_out: "dict | None" = None,
+    correction_mask: "torch.Tensor | None" = None,
+    apply_everywhere: bool = False,
 ) -> torch.Tensor:
     """GPU/torch equivalent of align_depth_frame(method="lstsq").
 
@@ -1744,6 +1824,14 @@ def align_depth_frame_gpu(
     accumulation), clips s, and applies (s, t) to the NON-static pixels only —
     exactly like the numpy path. Not byte-identical to it (GPU reduction order),
     but within float rounding. All tensors are (H,W) cuda; returns a new (H,W).
+
+    `correction_mask`, when given, widens the FIT exclusion to also cover the
+    composite's dilated+feathered footprint ring (DA360 edge-bleed near a
+    moving object shouldn't feed the fit). `apply_everywhere`, when True,
+    applies (s, t) to the whole frame instead of just the non-static pixels —
+    safe under bglock, where the composite locks alpha≈0 pixels to depth_ref
+    regardless of what this function wrote there, and cheaper than computing
+    an exact composite-footprint mask for the application step too.
     """
     finite_ref = depth_ref[torch.isfinite(depth_ref) & (depth_ref > 0)]
     if finite_ref.numel() > 0:
@@ -1760,6 +1848,8 @@ def align_depth_frame_gpu(
         & (depth_frame < outlier_cap)  # §4.3: excludes backend outliers from the fit
         & (depth_ref < outlier_cap)
     )
+    if correction_mask is not None:
+        static &= correction_mask == 0
     n_static = int(static.sum().item())
     if n_static < min_static_pixels:
         return depth_frame.clamp_min(0.0)
@@ -1803,7 +1893,7 @@ def align_depth_frame_gpu(
         diag_out["static_mask"] = static.cpu().numpy()
 
     out = depth_frame.clone()
-    nm = ~static
+    nm = torch.ones_like(static) if apply_everywhere else ~static
     out[nm] = s * out[nm] + t
     return out.clamp_min(0.0)
 
@@ -1896,7 +1986,7 @@ def _estimate_scale_shift(
 def segment_with_flows(
     video_path: str,
     output_path: Path,
-    viz_frames: np.ndarray,
+    waft_frames: np.ndarray,
     flow_masks: np.ndarray,
     meta: dict,
     n_total_frames: int,

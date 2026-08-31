@@ -52,7 +52,12 @@ def compute_scene_defaults(
     p99 = float(np.percentile(valid_depths, 99))
 
     return {
-        "sky_threshold": max(p95, p1 + 1.0),  # At least 1m range
+        # p95-based sky_threshold was clipping 5-7% of real far background as
+        # "sky" (detect_sky_depth cuts at sky_threshold*0.9) on scenes with a
+        # long legitimate far tail (e.g. warehouse back walls) but no actual
+        # sky. p99 matches depth_max's own percentile basis, so sky detection
+        # only fires on the same ~1% outlier tail depth_max already excludes.
+        "sky_threshold": max(p99, p1 + 1.0),  # At least 1m range
         "depth_min": max(0.01, p1 * 0.8),     # 20% margin below 1st percentile
         "depth_max": p99 * 1.1,                # 10% margin above 99th percentile
         "orbit_radius": max(0.05, p50 * 0.05), # 5% of median depth

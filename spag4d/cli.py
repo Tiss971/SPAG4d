@@ -27,7 +27,7 @@ def main():
 @click.option('--depth-min', default=0.1, help='Minimum depth in meters')
 @click.option('--depth-max', default=100.0, help='Maximum depth in meters')
 @click.option('--sky-threshold', default=80.0, help='Sky depth threshold (0 to disable)')
-@click.option('--outlier-pruning', default=0.0, help='Outlier removal strength (0=off, low = 0.1, default = 0.3, 1=aggressive)')
+@click.option('--outlier-pruning', default=0.0, help='Outlier removal strength (0=off, recommended max 0.1, 1=aggressive)')
 @click.option('--grazing-angle', default=90.0, help='Grazing angle threshold for outlier pruning (degrees) (default = 65.0, low = 85.0, off = 90.0)')
 @click.option('--sparse-pruning', default=0.0, help='Sparse region pruning strength (0=off, low = 0.1, default = 0.3, 1=aggressive)')
 @click.option('--global-scale', default=1.0, help='Depth scale multiplier')

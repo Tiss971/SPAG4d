@@ -205,6 +205,7 @@ def filter_gaussian_candidates(
     sky_detection: str = "gradient",  # "gradient" | "depth" | "none"
     min_density_ratio: float = 0.30,
     seed: int = 42,
+    sky_threshold: float | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute a boolean mask of valid Gaussian pixel positions.
@@ -249,10 +250,14 @@ def filter_gaussian_candidates(
     valid_depth = np.isfinite(depth_stride) & (depth_stride > depth_min) & (depth_stride < depth_max)
 
     # ── Sky detection ──
+    # Uses sky_threshold (a much tighter percentile than depth_max) when given,
+    # so genuinely-far but valid background isn't misclassified as sky just
+    # because it's beyond the same cutoff used for depth-range validity.
+    sky_cutoff = depth_max if sky_threshold is None else sky_threshold
     if sky_detection == "gradient":
-        sky_mask_full = detect_sky_gradient(depth_map, erp_image, depth_max=depth_max)
+        sky_mask_full = detect_sky_gradient(depth_map, erp_image, depth_max=sky_cutoff)
     elif sky_detection == "depth":
-        sky_mask_full = detect_sky_depth(depth_map, depth_max=depth_max)
+        sky_mask_full = detect_sky_depth(depth_map, depth_max=sky_cutoff)
     else:
         sky_mask_full = np.zeros((H, W), dtype=bool)
 

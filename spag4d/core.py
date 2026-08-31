@@ -87,7 +87,7 @@ class SPAG4D:
         depth_max: float | None = None,
         sky_threshold: float | None = None,
         stride: int = 2,
-        outlier_pruning: float = 0.3,
+        outlier_pruning: float = 0.1,
         grazing_angle: float = 65.0,
         sparse_pruning: float = 0.3,
         global_scale: float = 1.0,
