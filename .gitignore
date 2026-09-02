@@ -135,11 +135,12 @@ temp_spag4d/
 *.tmp
 *.temp
 
-# Depth-stability benchmark: heavy PLY point clouds (keep stats.json + comparison.png only)
-benchmark_*/
 .sandbox/
-# Benchmarks: keep the JSON/MD/logs, never the heavy per-frame dumps
-benchmarks/**/depth_maps/
-benchmarks/**/*.npy
-benchmarks/**/gaussians/
-benchmarks/**/images/
+# Benchmarks: ignore everything by default
+benchmarks/**
+
+# Re-include directory tree structure so Git can scan subfolders
+!benchmarks/**/
+
+# Re-include light text/log formats
+!benchmarks/**/*.md

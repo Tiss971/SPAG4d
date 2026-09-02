@@ -146,8 +146,8 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<n> \
   scripts/run_bglock_audit.py <clip.mp4> <out_dir>
 ```
 
-**`SPAG_SAM3_MAXSIZE=768`, not 1536** — read `benchmarks/T1_T2_P0_AUDIT.md` before trusting any
-recorded maxsize number. The flag applied its factor to the WAFT-shrunk shape rather than native
+**`SPAG_SAM3_MAXSIZE=768`, not 1536** — before trusting any recorded maxsize number, know that the
+flag applied its factor to the WAFT-shrunk shape rather than native
 (fixed 2026-08-17), so every "maxsize=1536" result in the B1 doc was actually measured at
 **614-818 px effective**, and its "target res" column is the buggy composed value. Post-fix,
 `768` reproduces the validated-safe operating point uniformly across clips (MattSwift's IoU-0.93
@@ -170,6 +170,20 @@ rule 1. Mechanism: bf16's weight-precision loss removes just enough margin on an
 downscaled 768×384 input to lose thin limbs. Do not stack them for speed, and never use
 `SPAG_SAM3_SCALE` (it anchors off the already-WAFT-shrunk shape, giving a real 0.2-0.25× factor
 rather than the 0.5 it advertises).
+
+**2026-08-18 defaults + isolated VRAM check (single-clip, MattSwift, same-GPU pair):** `SPAG_SAM3_BF16`
+default flipped on, `SPAG_SAM3_MAXSIZE` default flipped off (0/native) so the two stay solo by
+default — see CLAUDE.md. This also resolved a live mystery: `benchmarks/rebenchmark_2026-08-18/`
+showed a ~46% mean VRAM drop vs `baseline_2026-07-27` under the *old* defaults (maxsize=1536,
+bf16 off then), initially suspected to be bf16 (it wasn't wired into any default at the time).
+Isolated re-test on MattSwift alone: baseline 18,080 MB → bf16-alone-native 16,468 MB (−8.9%) →
+**maxsize=1536-alone (bf16 off) 12,377 MB (−31.5%)**, closely matching the rebenchmark's 13,883 MB
+for the same combo (residual gap = normal cross-GPU noise, rule 1). **The maxsize downscale, not
+bf16, was responsible for nearly all of the rebenchmark's VRAM drop.** Net: maxsize=1536-alone
+saves more VRAM than bf16-alone-native (12.4GB vs 16.5GB) at a real fidelity cost (IoU 0.93 vs
+0.99, table above) — an open choice between the two as the shipped default, not yet decided;
+today's default keeps bf16 (fidelity-first). Revisit once VRAM pressure (`project_vram_target_16gb`
+memory: max across clips must stay <16GB) is checked against more than one clip.
 
 ## 11. Never quote a stability number without its paired fidelity number
 
@@ -196,8 +210,8 @@ non-decisional.
 session: of the four P0 items, **two premises were false on inspection** (§4.1 confidence
 absorbing at zero — a per-frame reset already prevents it; §4.4 PaGeR per-frame CLIP routing —
 `metric=False` short-circuits, and `da360` is the production generator). Neither needed a run.
-See `benchmarks/T1_T2_P0_AUDIT.md`. Read the code path end-to-end first; a benchmark that confirms a
-non-existent bug is pure cost.
+See `bglock_open_questions.md` §4.1 and §10.4. Read the code path end-to-end first; a benchmark that
+confirms a non-existent bug is pure cost.
 
 The corollary is not "skip the run": reading §4.1's path closely enough to disprove it surfaced a
 *different*, real defect one line below (the reset that prevented the absorbing state also made
@@ -240,3 +254,33 @@ it is the clip that caught the `SPAG_SAM3_SCALE` leg-crop, the bf16+maxsize inte
 `fg_depth_cv` determinism swing. A change that looks clean on the short clip alone has not been
 tested against the failure mode this repo actually has. Full 10-clip runs stay reserved for
 ship decisions (rule 3).
+
+## 17. Appearance-only changes need their own canary pair, and their own metric
+
+Rules 2/8/11 cover geometry fidelity (mask IoU, visual overlay, dynamic-region derivative), but
+none of them would catch a background-*color* regression — a lever that freezes a Gaussian's
+color as well as its position can post a perfect `bg_depth_cv` and a clean mask IoU while quietly
+making shadows/screens dead. Caught this validating `freeze_bg_live_color` (2026-08-21, see
+CLAUDE.md "Changed 2026-08-21"): use a matched clip pair chosen for appearance-vs-geometry
+divergence specifically —
+
+- `circulation_site_1_edit_coupe` — moving shadows on an otherwise-static floor (appearance
+  changes, geometry doesn't).
+- `boutique1_HQ` — flat screens, some SAM-tracked as dynamic, some not (the untracked ones are
+  exactly the case a background-locking lever can accidentally freeze).
+
+Neither depth-CV nor mask IoU says anything about color, so the check has to read the PLY color
+channel directly: dump `_freeze_bg_meta.json`'s `n_bg_points` to slice just the frozen-background
+block (it's always the first N points when `freeze_bg` concatenates it), then diff that block's
+color between two frames far apart in the clip. A working live-color lever shows nonzero,
+growing `mean|Δ|` there; a fully-frozen lever shows exactly `0.0`, and a lever that only *claims*
+to update color but doesn't wire the mask/pixel-index correctly will silently show `0.0` too —
+this is the way a broken implementation gets caught, since it can't be told apart from "working"
+by geometry metrics alone:
+
+```python
+n_bg = json.load(open(f"{arm_dir}/gaussians/_freeze_bg_meta.json"))["n_bg_points"]
+c0  = load_ply_colors(f"{arm_dir}/gaussians/frame_0.ply")[:n_bg]
+cN  = load_ply_colors(f"{arm_dir}/gaussians/frame_N.ply")[:n_bg]
+mean_abs_delta = np.abs(c0 - cN).mean()  # ~0 = frozen (bug if the lever claims otherwise); >0 growing = live
+```

@@ -62,5 +62,6 @@
       "Bash(cp /tmp/claude-1005/-raid-mb273924-SPAG4d/fc2096bc-a5b5-4d48-be25-a3baede361bc/scratchpad/PRODUCTION_ROLLOUT.md /raid/mb273924/SPAG4d/.claude/)",
       "Bash(cp /tmp/claude-1005/-raid-mb273924-SPAG4d/fc2096bc-a5b5-4d48-be25-a3baede361bc/scratchpad/metrics_dashboard.html /raid/mb273924/SPAG4d/.claude/)"
     ]
-  }
+  },
+  "prefersReducedMotion": false
 }

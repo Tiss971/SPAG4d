@@ -28,7 +28,8 @@ ARMS = ["legacy", "decay", "noprop"]
 
 def fg_derivative(depth_dir: Path) -> dict:
     """Mean |d_t - d_{t-1}| over pixels dynamic in BOTH frames, scale-normalised."""
-    idxs = sorted(int(p.stem.split("_")[1]) for p in depth_dir.glob("depth_*.npy"))
+    idxs = sorted(int(p.stem.split("_")[1]) for p in depth_dir.glob("depth_*.npy")
+                  if p.stem.split("_")[1].isdigit())
     prev_d = prev_m = None
     vals, npx = [], []
     for i in idxs:

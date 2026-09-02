@@ -48,7 +48,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from tqdm import tqdm
+
+from .progress import log_tqdm as tqdm
 
 # from spag4d.video import print_gpu_stats
 

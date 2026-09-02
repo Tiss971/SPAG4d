@@ -3,7 +3,9 @@ import contextlib
 import csv
 import gc
 import os
+import resource
 import time
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,7 +20,6 @@ from sam3.visualization_utils import (
     prepare_masks_for_visualization,
     visualize_formatted_frame_output,
 )
-from tqdm import tqdm
 
 from .core import SPAG4D, ConversionResult
 from .detect_opticalflow import WAFTWrapper, abs_to_rel_coords
@@ -34,6 +35,7 @@ from .flow_depth_propagation import (
     upscale_flow,
 )
 from .ply_writer import save_ply_gsplat
+from .progress import log_tqdm as tqdm
 from .scene_analysis import compute_scene_defaults
 
 
@@ -172,22 +174,40 @@ def compute_temporal_median(
             for _, mask in masks_dict[native_idx].items():
                 # Guard against malformed SAM masks (some videos yield a
                 # degenerate 1D array instead of an (H, W) mask -> broadcast error)
-                if getattr(mask, "shape", None) != (H, W):
+                mask_shape = getattr(mask, "shape", None)
+                if mask_shape is None or len(mask_shape) != 2:
                     continue
+                if mask_shape != (H, W):
+                    # outputs_per_frame/masks_dict is kept at SAM3's working
+                    # resolution (not eagerly upsampled -- see
+                    # docs/RAM_USAGE_INVESTIGATION_PLAN.md); upsample lazily
+                    # here too, same INTER_NEAREST as the old eager path.
+                    mask_u8 = mask.astype(np.uint8) if mask.dtype == bool else mask
+                    mask = cv2.resize(mask_u8, (W, H), interpolation=cv2.INTER_NEAREST)
                 masks_array[idx] = np.maximum(masks_array[idx], mask)
 
     median_frame = np.zeros((H, W, C), dtype=frames_array.dtype)
     median_frame[:, :, 0] = 1.0
     std_frame = np.zeros((H, W), dtype=np.float32)
+    # Row-chunked: converting a whole channel (F,H,W) to float32 in one shot,
+    # then .clone()-ing it for the NaN-median pass, holds ~2 full-clip float32
+    # buffers live at once per channel (~6GB + ~6GB on a 204-frame 3840x1920
+    # clip) -- and since PyTorch's CPU allocator never returns freed RSS to
+    # the OS, each channel's peak becomes a permanent floor for the rest of
+    # the process (same failure mode fixed for viz_tensor in the flow-setup
+    # block above; see docs/RAM_USAGE_INVESTIGATION_PLAN.md). Median/std are
+    # independent per-pixel across H, so chunk over rows instead of holding
+    # the whole (F,H,W) channel live at once.
+    _row_chunk = max(1, 256 * 1024 * 1024 // max(1, F * W * 4))  # ~256MB per chunk buffer
     for c in range(C):  # Channel by channel to reduce VRAM usage
-        channel_tensor = torch.from_numpy(frames_array[..., c]).float().to(device)
-        # We temporarily set masked positions to NaN just for the median operation
-        median_calc_tensor = channel_tensor.clone()
-        median_calc_tensor[masks_array] = float("nan")
-        median_frame[:, :, c] = torch.nanmedian(median_calc_tensor, dim=0).values.cpu().numpy()
-
-        # 3. For the STD: Compute normally
-        std_frame += torch.std(channel_tensor, dim=0).cpu().numpy()
+        for r0 in range(0, H, _row_chunk):
+            r1 = min(r0 + _row_chunk, H)
+            channel_tensor = torch.from_numpy(frames_array[:, r0:r1, :, c]).float().to(device)
+            median_calc_tensor = channel_tensor.clone()
+            median_calc_tensor[masks_array[:, r0:r1, :]] = float("nan")
+            median_frame[r0:r1, :, c] = torch.nanmedian(median_calc_tensor, dim=0).values.cpu().numpy()
+            std_frame[r0:r1, :] += torch.std(channel_tensor, dim=0).cpu().numpy()
+            del channel_tensor, median_calc_tensor
 
     sample_count = (F - masks_array.sum(axis=0)).astype(np.int32)  # (H, W): valid (unmasked) frames per pixel
     always_masked = masks_array.all(axis=0)  # (H, W): masked in every single frame
@@ -457,10 +477,37 @@ def run_video(
     start_time = time.time()
     step_times = {}  # phase_name -> wall seconds, printed as a summary table at the end
 
+    ram_trace = os.environ.get("SPAG_RAM_TRACE", "0") == "1"
+    ram_trace_path = output_folder / "ram_trace.csv"
+    if ram_trace:
+        with open(ram_trace_path, "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["checkpoint", "ru_maxrss_mb", "tracemalloc_current_mb", "tracemalloc_peak_mb", "top_growth"]
+            )
+
+    def _ram_checkpoint(label: str, prev_snapshot=None):
+        if not ram_trace:
+            return prev_snapshot
+        cur_mb, peak_mb = (v / (1024 * 1024) for v in tracemalloc.get_traced_memory())
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        snapshot = tracemalloc.take_snapshot()
+        top_growth = ""
+        if prev_snapshot is not None:
+            diffs = snapshot.compare_to(prev_snapshot, "lineno")[:3]
+            top_growth = " | ".join(str(d) for d in diffs)
+        with open(ram_trace_path, "a", newline="") as f:
+            csv.writer(f).writerow([label, f"{rss_mb:.1f}", f"{cur_mb:.1f}", f"{peak_mb:.1f}", top_growth])
+        return snapshot
+
+    if ram_trace:
+        tracemalloc.start()
+    _ram_trace_prev_snapshot = _ram_checkpoint("start")
+
     t0 = time.time()
     viz_frames, meta = extract_video_frames(str(video_path), output_folder, skip_step=skip_step, export=True)
     step_times["frame_extraction"] = time.time() - t0
     n_total_frames = len(viz_frames)
+    _ram_trace_prev_snapshot = _ram_checkpoint("after_frame_extraction", _ram_trace_prev_snapshot)
 
     # Flow
     # Defined up-front so a WAFT failure falls back to SAM cleanly instead of
@@ -526,16 +573,34 @@ def run_video(
             checkpoint = '/raid/mb273924/_DATASETS/uptale/tar-c-t.pth',
             config = '/raid/mb273924/WAFT/config/a1/tar-c-t.json'
         )
+        _ram_trace_prev_snapshot = _ram_checkpoint("after_waft_init", _ram_trace_prev_snapshot)
         MAX_SIZE = 1024
         scale = min(MAX_SIZE / max(meta["W"], meta["H"]), 1.0)  # never upscale
         if scale < 1.0:
             new_W = int(meta["W"] * scale) & ~1  # force even dimensions (codec requirement)
             new_H = int(meta["H"] * scale) & ~1
 
-            viz_tensor = torch.from_numpy(viz_frames).permute(0, 3, 1, 2).float()
-            downscaled = F.interpolate(viz_tensor, size=(new_H, new_W), mode="bilinear")
-            # Retour en NHWC uint8 NumPy pour WAFT
-            waft_frames = downscaled.permute(0, 2, 3, 1).byte().numpy()
+            # Chunked downscale: converting the whole clip to float32 in one
+            # torch.from_numpy(...).float() call materializes a CPU tensor
+            # sized frames*H*W*3*4 bytes (~2.9GB for a 39-frame 3840x1920
+            # clip, ~15GB for a 204-frame one) -- and PyTorch's CPU allocator
+            # never returns that RSS to the OS once touched (confirmed: an
+            # explicit del right after does not reclaim it), so it becomes a
+            # permanent floor for the rest of the process. Chunking bounds
+            # the largest simultaneously-live float32 buffer to one chunk's
+            # worth instead of the whole clip's. Measured: -17.9% peak RAM on
+            # a 39-frame clip, -28.7% on a 204-frame clip, no time/VRAM cost
+            # at chunk=8 (see docs/RAM_USAGE_INVESTIGATION_PLAN.md).
+            _chunk = 8
+            waft_chunks = []
+            for _start in range(0, len(viz_frames), _chunk):
+                _batch = torch.from_numpy(viz_frames[_start:_start + _chunk]).permute(0, 3, 1, 2).float()
+                _batch = F.interpolate(_batch, size=(new_H, new_W), mode="bilinear")
+                waft_chunks.append(_batch.permute(0, 2, 3, 1).byte().numpy())
+                del _batch
+            waft_frames = np.concatenate(waft_chunks, axis=0)
+            del waft_chunks
+            _ram_trace_prev_snapshot = _ram_checkpoint("after_waft_frames_numpy", _ram_trace_prev_snapshot)
         else:
             new_W, new_H = meta["W"], meta["H"]
             waft_frames = viz_frames
@@ -593,9 +658,8 @@ def run_video(
                         n_seam_recompute += 1
                 if need_pad:
                     ff, fb = compute_bidirectional_flow(model, waft_frames[i], waft_frames[i + 1], seam_pad=flow_seam_pad)
-                if scale < 1.0:
-                    ff = upscale_flow(ff, meta["H"], meta["W"])
-                    fb = upscale_flow(fb, meta["H"], meta["W"])
+                # Kept at WAFT working resolution -- see comment on the
+                # default-path population below.
                 flows_fwd.append(ff)
                 flows_bwd.append(fb)
             n_pairs = n_total_frames - 1
@@ -603,12 +667,15 @@ def run_video(
             print(f"  {n_pairs} pairs (single pass{extra}) in {time.time() - t0:.1f}s")
         else:
             # Forward-only WAFT pass to build the SAM magnitude masks.
+            _ram_trace_prev_snapshot = _ram_checkpoint("before_flow_maskpass", _ram_trace_prev_snapshot)
             stats = model.run(waft_frames, meta, output_folder, 0.5)
+            _ram_trace_prev_snapshot = _ram_checkpoint("after_flow_maskpass", _ram_trace_prev_snapshot)
             flow_masks = stats["masks"]
             try:
                 reencode_h264(str(output_folder / "flows.mp4"))
             except Exception:
                 pass
+            _ram_trace_prev_snapshot = _ram_checkpoint("after_reencode", _ram_trace_prev_snapshot)
 
             if depth_correction == "bglock":
                 # Bidirectional flow (seam-padded, forward-backward consistency)
@@ -617,13 +684,21 @@ def run_video(
                 # pass over the same (already-downscaled) waft_frames.
                 print("[SPAG4D] Computing bidirectional WAFT flow for background-locked depth compositing...")
                 t0 = time.time()
+                # Kept at WAFT working resolution (not eagerly upscaled to
+                # native) -- flows_fwd/flows_bwd is a full-clip buffer held
+                # for the whole run because the per-frame loop does idx-1
+                # random-access lookback into it; upscale_flow's native-res
+                # resize was the dominant RAM contributor on real-world clips
+                # (see docs/RAM_USAGE_INVESTIGATION_PLAN.md). Callers upscale
+                # lazily, once per read, via upscale_flow (no-op if already
+                # native res).
+                _bidir_mid = (n_total_frames - 1) // 2
                 for i in range(n_total_frames - 1):
                     ff, fb = compute_bidirectional_flow(model, waft_frames[i], waft_frames[i + 1], seam_pad=flow_seam_pad)
-                    if scale < 1.0:
-                        ff = upscale_flow(ff, meta["H"], meta["W"])
-                        fb = upscale_flow(fb, meta["H"], meta["W"])
                     flows_fwd.append(ff)
                     flows_bwd.append(fb)
+                    if ram_trace and i == _bidir_mid:
+                        _ram_trace_prev_snapshot = _ram_checkpoint(f"bidir_mid_pair{i}", _ram_trace_prev_snapshot)
                 print(f"  {n_total_frames - 1} pairs in {time.time() - t0:.1f}s")
         step_times["flow_waft"] = time.time() - t_flow0
         if torch.cuda.is_available():
@@ -639,9 +714,12 @@ def run_video(
         del model
         gc.collect()
         torch.cuda.empty_cache()
+    _ram_trace_prev_snapshot = _ram_checkpoint("after_flow_waft", _ram_trace_prev_snapshot)
     # bgr to rgb
     viz_frames = viz_frames[:, :, :, ::-1].copy()
     # SAM
+    n_tracked_objects = None
+    mean_objects_per_frame = None
     if alignement_mask in ["sam", "sam_and_activity", "sam_and_flow", "nothing"]:
         startsam = time.time()
         if flow_masks is None:
@@ -649,7 +727,19 @@ def run_video(
         else:
             outputs_per_frame = segment_with_flows(str(video_path), output_folder, waft_frames, flow_masks, meta, n_total_frames, skip_step, flows_fwd=flows_fwd, flows_bwd=flows_bwd)
         step_times["sam3_segmentation"] = time.time() - startsam
+        _ram_trace_prev_snapshot = _ram_checkpoint("after_sam3_segmentation", _ram_trace_prev_snapshot)
         print(f"[SPAG4D] Background/Front segmentation of video completed in {(time.time() - startsam):.2f}s")
+        # outputs_per_frame[frame_idx] is {obj_id: mask} post prepare_masks_for_visualization.
+        _all_obj_ids = set()
+        _objs_per_frame_counts = []
+        for _frame_output in outputs_per_frame.values():
+            if isinstance(_frame_output, dict):
+                _all_obj_ids.update(_frame_output.keys())
+                _objs_per_frame_counts.append(len(_frame_output))
+        n_tracked_objects = len(_all_obj_ids)
+        mean_objects_per_frame = float(np.mean(_objs_per_frame_counts)) if _objs_per_frame_counts else 0.0
+        print(f"[SPAG4D] SAM3 tracked {n_tracked_objects} distinct object id(s), "
+              f"mean {mean_objects_per_frame:.1f} concurrent objects/frame")
         # Return SAM3's cached GPU blocks before the depth loop's peak.
         gc.collect()
         torch.cuda.empty_cache()
@@ -687,6 +777,7 @@ def run_video(
             viz_frames, outputs_per_frame, activity_std_threshold, skip_step, diag_dir=diag_dir,
             min_sample_frames=dref_min_samples,
         )
+        _ram_trace_prev_snapshot = _ram_checkpoint("after_temporal_median", _ram_trace_prev_snapshot)
         cv2.imwrite(output_folder / f"_temporal_activity_mask_abs{activity_std_threshold:g}.jpg", activity_mask)
     elif get_background_method == "last":
         master_background = viz_frames[-1]
@@ -958,6 +1049,20 @@ def run_video(
         and (depth_smoother is None or depth_smoother.method == "median")
         and torch.cuda.is_available()
     )
+    # SPAG_COMPOSITE_LOWRES=1: run propagate_depth_via_flow_torch's warp/FB-consistency
+    # math at WAFT working resolution (meta["new_W"]/["new_H"]) instead of native res,
+    # downscaling depth_prev_t/aligned_t/depth_ref_t/lock_t and the flow pair right
+    # before the call and upscaling only the single depth_object_t output back to
+    # native res afterward. Composite (composite_bg_locked*) and all diagnostics
+    # still run at native res, unaffected. Not lossless: full-frame depth RMSE
+    # ~0.20 (PSNR ~46dB) vs native-res compositing, concentrated at dynamic-object
+    # silhouette boundaries (~1.36 RMSE / ~29dB there) -- see
+    # docs/RAM_USAGE_INVESTIGATION_PLAN.md "Composite-at-low-res" section. Opt-in.
+    _composite_lowres = (
+        gpu_depth_chain
+        and os.environ.get("SPAG_COMPOSITE_LOWRES", "0") == "1"
+        and (meta["new_W"], meta["new_H"]) != (meta["W"], meta["H"])
+    )
     depth_ref_t = torch.from_numpy(depth_ref_np).to("cuda") if gpu_depth_chain else None
     depth_prev_t = None  # previous frame's composited depth as a cuda tensor
     # Keep the final bg-locked composite (feather + blend) on the GPU too.
@@ -1072,6 +1177,12 @@ def run_video(
         return image_tensor, depth_raw
 
     next_depth_result = _predict_depth(viz_frames[0])
+    # Growth-curve instrumentation for docs/RAM_USAGE_INVESTIGATION_PLAN.md: periodic
+    # ru_maxrss + tracemalloc snapshots every 20 frames, gated behind SPAG_RAM_TRACE so
+    # it stays zero-cost by default. Snapshot deltas distinguish linear-with-frames
+    # (leak/accumulation) from flat-with-spikes (peak driven by per-frame content).
+    _ram_trace_prev_snapshot = _ram_checkpoint("before_frame_loop", _ram_trace_prev_snapshot)
+
     for idx, frame in enumerate(tqdm(viz_frames)):
         # Depth estimation
         start_depth = time.time()
@@ -1113,6 +1224,16 @@ def run_video(
             output = outputs_per_frame[idx * skip_step]
             sam_mask = np.zeros((W, H), dtype=np.uint8)
             for _, mask in output.items():
+                # Lazy upsample: outputs_per_frame is kept at SAM3's native
+                # working resolution (see segment_with_sam) instead of eagerly
+                # upsampled to (W, H) for the whole clip up front -- avoids
+                # holding a full-native-res mask array per object per frame
+                # simultaneously (dominant RAM buffer, see
+                # docs/RAM_USAGE_INVESTIGATION_PLAN.md). Resize once per read
+                # instead, same INTER_NEAREST as the old eager path.
+                if mask.shape[:2] != (W, H):
+                    mask_u8 = mask.astype(np.uint8) if mask.dtype == bool else mask
+                    mask = cv2.resize(mask_u8, (H, W), interpolation=cv2.INTER_NEAREST)
                 sam_mask = np.maximum(sam_mask, mask)
             fused_mask = np.maximum(fused_mask, sam_mask)
 
@@ -1240,9 +1361,50 @@ def run_video(
                         (1.0 - _bglock_noflow_blend) * depth_prev_final
                         + _bglock_noflow_blend * aligned_depth_np
                     )
-            elif gpu_depth_chain:
+            elif gpu_depth_chain and _composite_lowres:
+                # Composite-at-low-res: keep flow at WAFT working res (no upscale)
+                # and downscale the other three inputs to match, so the whole
+                # warp/FB-consistency/blend math runs at ~1/14th the pixel count.
+                # Single output upscaled back to native res once.
+                lr_h, lr_w = meta["new_H"], meta["new_W"]
                 flow_fwd_t = torch.from_numpy(flows_fwd[idx - 1]).to("cuda")
                 flow_bwd_t = torch.from_numpy(flows_bwd[idx - 1]).to("cuda")
+                depth_prev_lr = F.interpolate(
+                    depth_prev_t[None, None], size=(lr_h, lr_w), mode="bilinear"
+                )[0, 0]
+                aligned_lr = F.interpolate(
+                    aligned_t[None, None], size=(lr_h, lr_w), mode="bilinear"
+                )[0, 0]
+                depth_ref_lr = F.interpolate(
+                    depth_ref_t[None, None], size=(lr_h, lr_w), mode="bilinear"
+                )[0, 0]
+                lock_lr = F.interpolate(
+                    lock_t[None, None].float(), size=(lr_h, lr_w), mode="nearest"
+                )[0, 0]
+                depth_object_lr_t = propagate_depth_via_flow_torch(
+                    depth_prev_lr,
+                    aligned_lr,
+                    depth_ref_lr,
+                    flow_fwd_t,
+                    flow_bwd_t,
+                    flow_state,
+                    fb_err_threshold=fb_err_threshold,
+                    pole_margin_frac=pole_margin_frac,
+                    disocclusion_mask=lock_lr,
+                )
+                depth_object_t = F.interpolate(
+                    depth_object_lr_t[None, None], size=(meta["H"], meta["W"]), mode="bilinear"
+                )[0, 0]
+                depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
+            elif gpu_depth_chain:
+                # flows_fwd/flows_bwd are stored at WAFT working resolution;
+                # propagate_depth_via_flow_torch requires flow and depth at
+                # matching resolution, so upscale lazily here (no-op if
+                # already native res). See population comment above.
+                flow_fwd_native = upscale_flow(flows_fwd[idx - 1], meta["H"], meta["W"])
+                flow_bwd_native = upscale_flow(flows_bwd[idx - 1], meta["H"], meta["W"])
+                flow_fwd_t = torch.from_numpy(flow_fwd_native).to("cuda")
+                flow_bwd_t = torch.from_numpy(flow_bwd_native).to("cuda")
                 depth_object_t = propagate_depth_via_flow_torch(
                     depth_prev_t,
                     aligned_t,
@@ -1256,12 +1418,16 @@ def run_video(
                 )
                 depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
             else:
+                # See gpu_depth_chain branch above: flows_fwd/flows_bwd are
+                # stored at WAFT working resolution, upscale lazily on read.
+                flow_fwd_native = upscale_flow(flows_fwd[idx - 1], meta["H"], meta["W"])
+                flow_bwd_native = upscale_flow(flows_bwd[idx - 1], meta["H"], meta["W"])
                 depth_object, _, _ = propagate_depth_via_flow(
                     depth_prev_final,
                     aligned_depth_np,
                     depth_ref_np,
-                    flows_fwd[idx - 1],
-                    flows_bwd[idx - 1],
+                    flow_fwd_native,
+                    flow_bwd_native,
                     flow_state,
                     fb_err_threshold=fb_err_threshold,
                     pole_margin_frac=pole_margin_frac,
@@ -1315,7 +1481,9 @@ def run_video(
             # check_camera_static.py logic (median over the composite's own
             # static definition, lock_mask==0).
             if idx >= 1 and (idx - 1) < len(flows_fwd):
-                flow_static = flows_fwd[idx - 1][lock_mask == 0]
+                # flows_fwd is at WAFT working resolution; lock_mask is native
+                # -- upscale lazily to match (no-op if already native res).
+                flow_static = upscale_flow(flows_fwd[idx - 1], meta["H"], meta["W"])[lock_mask == 0]
                 flow_med_dx = float(np.median(flow_static[:, 0])) if flow_static.size else float("nan")
                 flow_med_dy = float(np.median(flow_static[:, 1])) if flow_static.size else float("nan")
                 flow_med_mag = float(np.median(np.hypot(flow_static[:, 0], flow_static[:, 1]))) if flow_static.size else float("nan")
@@ -1355,9 +1523,19 @@ def run_video(
             # (f) per-object mean in-mask flow magnitude.
             obj_flow_strs = []
             if idx >= 1 and (idx - 1) < len(flows_fwd):
-                flow_mag_full = np.hypot(flows_fwd[idx - 1][..., 0], flows_fwd[idx - 1][..., 1])
+                # flows_fwd is at WAFT working resolution; output's masks are
+                # SAM3's native working resolution too (see segment_with_sam),
+                # which is not necessarily the same size as WAFT's -- resize
+                # the (small) per-object mask to flow's shape rather than
+                # upscaling the (large) flow field, to match resolutions
+                # cheaply here.
+                ff = flows_fwd[idx - 1]
+                flow_mag_full = np.hypot(ff[..., 0], ff[..., 1])
                 for obj_id, obj_mask in output.items():
-                    m = obj_mask.astype(bool)
+                    m = obj_mask.astype(np.uint8) if obj_mask.dtype == bool else obj_mask
+                    if m.shape[:2] != flow_mag_full.shape[:2]:
+                        m = cv2.resize(m, (flow_mag_full.shape[1], flow_mag_full.shape[0]), interpolation=cv2.INTER_NEAREST)
+                    m = m.astype(bool)
                     if m.any():
                         obj_flow_strs.append(f"{obj_id}:{float(flow_mag_full[m].mean()):.3f}")
             per_object_flow_mag = ";".join(obj_flow_strs)
@@ -1394,7 +1572,12 @@ def run_video(
             # .claude/D1_FUTURE_WORK_PLAN.md). flows_fwd only exists on the bglock
             # flow path and has no entry for frame 0 (no t-1), so guard on both.
             if idx >= 1 and (idx - 1) < len(flows_fwd):
-                np.save(depth_npy_dir / f"flow_{idx}.npy", flows_fwd[idx - 1].astype(np.float32))
+                # flows_fwd is stored at WAFT working resolution (not eagerly
+                # upscaled -- see docs/RAM_USAGE_INVESTIGATION_PLAN.md);
+                # upscale lazily here to preserve this export's native-res
+                # contract with FreeTimeGS.
+                flow_native = upscale_flow(flows_fwd[idx - 1], meta["H"], meta["W"])
+                np.save(depth_npy_dir / f"flow_{idx}.npy", flow_native.astype(np.float32))
 
         # Foreground depth_min must NOT reuse the background-reference-derived
         # `depth_min` computed above: depth_ref_np is a static/background estimate
@@ -1455,9 +1638,13 @@ def run_video(
             colors_linear=colors_linear,
         ))
 
+        if ram_trace and (idx % 20 == 0 or idx == len(viz_frames) - 1):
+            _ram_trace_prev_snapshot = _ram_checkpoint(f"frame_{idx}", _ram_trace_prev_snapshot)
+
     for f in ply_futures:
         f.result()
     ply_executor.shutdown(wait=True)
+    _ram_trace_prev_snapshot = _ram_checkpoint("after_ply_futures_drained", _ram_trace_prev_snapshot)
     if diag_file is not None:
         diag_file.close()
         print(f"[SPAG4D] §9 diagnostics CSV written: {diag_csv_path}")
@@ -1529,9 +1716,22 @@ def run_video(
         return stats
 
     if aligned_depth_list_cpu:
-        # stack_np = torch.stack(aligned_depth_list_cpu, dim=0).cpu().numpy()
-        stack_np = np.stack(aligned_depth_list_cpu, axis=0)
-        depth_std_all = np.nanstd(stack_np, axis=0)
+        # Row-chunked nanstd: np.stack(aligned_depth_list_cpu) materializes a
+        # second full-clip float buffer on top of the list already held for
+        # the whole run (~6GB on a 204-frame 3840x1920 clip, doubling
+        # momentarily to ~12GB) -- nanstd is per-pixel independent across the
+        # frame axis, so chunk over rows instead of stacking the whole clip
+        # at once (same pattern as compute_temporal_median's fix above; see
+        # docs/RAM_USAGE_INVESTIGATION_PLAN.md).
+        _dh, _dw = aligned_depth_list_cpu[0].shape[:2]
+        depth_std_all = np.zeros((_dh, _dw), dtype=np.float32)
+        _drow_chunk = max(1, 256 * 1024 * 1024 // max(1, len(aligned_depth_list_cpu) * _dw * 4))
+        for _r0 in range(0, _dh, _drow_chunk):
+            _r1 = min(_r0 + _drow_chunk, _dh)
+            _stack_chunk = np.stack([a[_r0:_r1] for a in aligned_depth_list_cpu], axis=0)
+            depth_std_all[_r0:_r1] = np.nanstd(_stack_chunk, axis=0)
+            del _stack_chunk
+        _ram_trace_prev_snapshot = _ram_checkpoint("after_aligned_depth_stack", _ram_trace_prev_snapshot)
         stats_all = stats_it(depth_std_all)
         if np.nanmax(depth_std_all) > 0:
             depth_std_map = np.clip(
@@ -1607,6 +1807,22 @@ def run_video(
         "fg_median_deltas": foreground_depth_deltas,
     }
 
+    # ru_maxrss is peak RSS (KB on Linux) since process start, not just this call --
+    # matches the semantics of torch.cuda.max_memory_allocated() callers already use
+    # for VRAM (a running peak, reset by the caller between runs if isolation is needed).
+    _ram_trace_prev_snapshot = _ram_checkpoint("before_return", _ram_trace_prev_snapshot)
+    ram_max_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+    depth_reproj_consistency = None
+    if depth_npy_dir is not None:
+        from spag4d.reconstruction_metrics import compute_depth_reprojection_consistency
+        depth_reproj_consistency = compute_depth_reprojection_consistency(depth_npy_dir)
+        if depth_reproj_consistency is not None:
+            print(f"[SPAG4D] depth reprojection consistency: bg_mean_err="
+                  f"{depth_reproj_consistency['bg_mean_err']} fg_mean_err="
+                  f"{depth_reproj_consistency['fg_mean_err']} bg_flagged_frames="
+                  f"{depth_reproj_consistency['bg_flagged_frames']}")
+
     return ConversionResult(
         output_path=output_path.replace(".ply", "_0.ply"),
         splat_count=n_gaussians,
@@ -1616,6 +1832,10 @@ def run_video(
         depth_npy_path=None,  # str(depth_npy_path) if depth_npy_path else None,
         panorama_size=(W, H),
         depth_metrics=depth_metrics,
+        ram_max_mb=ram_max_mb,
+        n_tracked_objects=n_tracked_objects,
+        mean_objects_per_frame=mean_objects_per_frame,
+        depth_reproj_consistency=depth_reproj_consistency,
     )
 
 
@@ -2909,15 +3129,15 @@ def segment_with_flows(
         # `waft_frames` param (WAFT-scaled) and not meta['new_H']/new_W (the
         # WAFT/mask working resolution, a different knob). Confirmed by two
         # real crashes against each wrong target before landing on native
-        # meta['H']/meta['W']. Upsample every mask there.
-        _native_H, _native_W = meta['H'], meta['W']
-        for _frame_idx, _obj_masks in outputs_per_frame.items():
-            for _obj_id, _mask in list(_obj_masks.items()):
-                if _mask.shape[:2] != (_native_H, _native_W):
-                    _mask_u8 = _mask.astype(np.uint8) if _mask.dtype == bool else _mask
-                    _obj_masks[_obj_id] = cv2.resize(
-                        _mask_u8, (_native_W, _native_H), interpolation=cv2.INTER_NEAREST
-                    )
+        # meta['H']/meta['W'].
+        #
+        # Upsampling used to happen here, eagerly, for every object in every
+        # frame -- but that means holding a full-native-resolution mask array
+        # per object per frame simultaneously for the whole clip (dominant RAM
+        # buffer on several benchmark clips, see
+        # docs/RAM_USAGE_INVESTIGATION_PLAN.md). Masks are now left at SAM3's
+        # working resolution here; run_video's per-frame loop upsamples each
+        # mask lazily, once, at the point it's actually consumed.
     except Exception as e:
         print(f"Error during propagation: {e}")
     else:

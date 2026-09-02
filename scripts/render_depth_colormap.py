@@ -33,6 +33,7 @@ def main():
     idxs = sorted(
         int(os.path.basename(p).split("_")[1].split(".")[0])
         for p in glob.glob(os.path.join(args.npy_dir, "depth_*.npy"))
+        if os.path.basename(p).split("_")[1].split(".")[0].isdigit()
     )
     if not idxs:
         raise SystemExit(f"No depth_*.npy found in {args.npy_dir}")

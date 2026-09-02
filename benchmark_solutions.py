@@ -36,7 +36,7 @@ BASE_KWARGS = dict(
     stride=8,
     temporal_consistency=False,
     freeze_bg=False,
-    outlier_pruning=0.3,
+    outlier_pruning=0.1,
     grazing_angle=85.0,
     sparse_pruning=0.1,
 )
@@ -49,15 +49,9 @@ BASE_KWARGS = dict(
 # name says.
 CONFIGS = {
     "baseline": dict(depth_correction="affine"),
-    # Background-locked compositing + flow propagation (see .claude/depth_stability_benchmark.md)
     "bglock": dict(depth_correction="bglock"),
-    # Solution 1: temporal depth smoothing
-    "sol1_median_w5": dict(depth_correction="affine", depth_smoothing=True,
-                           depth_smoothing_window=5, depth_smoothing_method="median"),
-    # "sol1_gaussian_w5": dict(depth_correction="affine", depth_smoothing=True,
-    #                          depth_smoothing_window=5, depth_smoothing_method="gaussian"),
-    "bglock_sol1_median_w5": dict(depth_correction="bglock", depth_smoothing=True,
-                           depth_smoothing_window=5, depth_smoothing_method="median")
+    "sol1_median_w5": dict(depth_correction="affine", depth_smoothing=True, depth_smoothing_window=5, depth_smoothing_method="median"),
+    "bglock_sol1_median_w5": dict(depth_correction="bglock", depth_smoothing=True, depth_smoothing_window=5, depth_smoothing_method="median")
 }
 
 
@@ -172,13 +166,14 @@ def run_config(converter, config_name, extra_kwargs, videos, gen, output_base):
                 "status": "completed",
                 "time_seconds": elapsed,
                 "vram_max_mb": max_vram_mb,
+                "ram_max_mb": res.ram_max_mb,
                 "n_frames": n_frames,
                 "mean_splats": mean_splats,
                 "stability": stab,
             }
             cv = stab.get("bg_depth_cv") if stab else None
             spk = stab.get("bg_spikes_per_frame") if stab else None
-            print(f"      done {elapsed:.1f}s | vram={max_vram_mb:.0f}MB | frames={n_frames} | "
+            print(f"      done {elapsed:.1f}s | vram={max_vram_mb:.0f}MB | ram={res.ram_max_mb:.0f}MB | frames={n_frames} | "
                   f"bg_cv={cv} | spikes/frame={spk}", flush=True)
         except Exception as e:
             import traceback

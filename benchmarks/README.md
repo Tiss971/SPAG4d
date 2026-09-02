@@ -7,8 +7,9 @@ that stays at this level, because it applies to all campaigns.
 | folder | what it holds |
 |---|---|
 | [`baseline_2026-07-27/`](baseline_2026-07-27/) | Shipped-production reference over the 10-clip set: `baseline_2026-07-27.json` + its writeup. A magnitude reference only — never diff a new run against it (rule 1). |
-| [`b1_vram_2026-07-31/`](b1_vram_2026-07-31/) | B1 VRAM/time levers: bf16 × `SPAG_SAM3_MAXSIZE` × `SPAG_SAM3_SCALE`, plus the per-clip colored-depth videos. **Its "target res" columns are mislabeled** — see `benchmarks/T1_T2_P0_AUDIT.md`, the maxsize factor was applied to the WAFT-shrunk shape. |
+| [`b1_vram_2026-07-31/`](b1_vram_2026-07-31/) | B1 VRAM/time levers: bf16 × `SPAG_SAM3_MAXSIZE` × `SPAG_SAM3_SCALE`, plus the per-clip colored-depth videos. **Its "target res" columns are mislabeled** — see `BENCHMARK_RULES.md` §10, the maxsize factor was applied to the WAFT-shrunk shape. |
 | [`confdecay_2026-08-17/`](confdecay_2026-08-17/) | Confidence-decay reactivation + flow-warped propagation state (T1 §4.1/§4.2 fixes). Three matched arms per clip: `legacy`, `decay`, `noprop`. |
+| *(not in this folder — see note below)* `freeze_bg_live_color` validation, 2026-08-21 | `freeze_bg`/`bglock`/`freeze_bg_live_color` 3-arm comparison on `circulation_site_1_edit_coupe` (shadows) + `boutique1_HQ` (screens). Output at repo-root `validate_freeze_bg_live_color_out{,_x2}/`, run via `validate_freeze_bg_live_color.py` — not yet relocated under `benchmarks/` per the convention below. See `BENCHMARK_RULES.md` §17 and `bglock_open_questions.md` §8.6. |
 
 Conventions:
 

@@ -25,6 +25,10 @@ class ConversionResult:
     depth_npy_path: str | None = None
     panorama_size: tuple | None = None
     depth_metrics: dict | None = None  # Per-frame depth stability metrics
+    ram_max_mb: float | None = None  # Peak host RSS during the run (see resource.getrusage in run_video)
+    n_tracked_objects: int | None = None  # Distinct SAM3 object ids tracked across the whole clip
+    mean_objects_per_frame: float | None = None  # Mean concurrent tracked objects per frame
+    depth_reproj_consistency: dict | None = None  # See spag4d/reconstruction_metrics.py; needs depth_npy_dir set
 
 
 class SPAG4D:

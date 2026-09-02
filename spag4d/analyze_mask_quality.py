@@ -47,7 +47,10 @@ def analyze_mask_quality(
         output = outputs_per_frame.get(idx * skip_step, {})
         sam_m = np.zeros((H, W), dtype=np.uint8)
         for _, m in output.items():
-            sam_m = np.maximum(sam_m, (m > 0).astype(np.uint8))
+            m_bin = (m > 0).astype(np.uint8)
+            if m_bin.shape[:2] != (H, W):
+                m_bin = cv2.resize(m_bin, (W, H), interpolation=cv2.INTER_NEAREST)
+            sam_m = np.maximum(sam_m, m_bin)
 
         # --- Flow mask for this frame, resized to SAM resolution ---
         if idx < len(flow_masks):

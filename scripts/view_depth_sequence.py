@@ -127,7 +127,7 @@ def main():
 
     depth_dir = args.run_dir / "depth_maps"
     images_dir = args.run_dir / "images"
-    n_frames = len(list(depth_dir.glob("depth_*.npy")))
+    n_frames = len(list(depth_dir.glob("depth_[0-9]*.npy")))  # exclude depth_ref.npy
     print(f"Found {n_frames} frames in {depth_dir}")
 
     prefetcher = FramePrefetcher(depth_dir, images_dir, n_frames)
