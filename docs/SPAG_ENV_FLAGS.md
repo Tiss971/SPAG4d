@@ -20,7 +20,7 @@ Status legend:
 | Flag | Default | Status | Notes |
 |---|---|---|---|
 | `SPAG_LOCK_ACTIVITY` | `1` | default-on | Bg-lock composite keys off `sam_mask` alone, not the fused SAM\|activity mask. Shipped 2026-07-28, see project CLAUDE.md. |
-| `SPAG_BGLOCK_NOFLOW` | `0` | opt-in | Disables flow use in bg-lock. Being benchmarked 2026-09-04 against default-flow to decide keep-vs-hardcode. |
+| `SPAG_BGLOCK_NOFLOW` | `1` | default-on | Skips flow-warp depth propagation in bg-lock (blends prev+aligned depth instead). Default flipped 2026-09-04: benchmarked faster (-14/-19% time) and better fg_depth_cv (-20/-38%) than flow-warp on 2 motion clips (atelier_1, accident_electrique_02), no measurable bg_depth_cv cost — confirms the code comment's hypothesis that flow-warp worsens the DA360 object-edge halo. Set `=0` to opt back into flow-warp. Not yet validated beyond these 2 clips. |
 | `SPAG_BGLOCK_NOFLOW_BLEND` | `0.5` | opt-in | Blend factor for no-flow bg-lock mode. |
 | `SPAG_DREF_MIN_SAMPLES` | `0` | opt-in | Min sample threshold for depth-reference. See `docs/bglock_open_questions.md` §5. |
 | `SPAG_HARD_DEPTH_CUTOVER` | `0` | opt-in | Hard cutover mode for depth compositing. See `docs/bglock_open_questions.md` §8.1. |

@@ -1001,7 +1001,12 @@ def run_video(
     # pixel-for-pixel (no per-pixel correspondence). Tests whether the object-depth
     # halo/ramp traced to DA360's own resolution limit (see docs/ da360 halo investigation,
     # 2026-08-20) is made worse by flow-warp interpolation, or is unaffected by it.
-    _bglock_noflow = os.environ.get("SPAG_BGLOCK_NOFLOW", "0") == "1"
+    # Default flipped to on 2026-09-04: benchmarked faster (-14/-19%) and
+    # better fg_depth_cv (-20/-38%) than flow-warp on 2 clips with real
+    # dynamic-object motion (atelier_1, accident_electrique_02), no bg cost.
+    # See docs/SPAG_ENV_FLAGS.md. Set SPAG_BGLOCK_NOFLOW=0 to opt back into
+    # flow-warp propagation.
+    _bglock_noflow = os.environ.get("SPAG_BGLOCK_NOFLOW", "1") == "1"
     _bglock_noflow_blend = float(os.environ.get("SPAG_BGLOCK_NOFLOW_BLEND", "0.5"))
     # Confidence decay now compounds over an age field warped along the flow
     # (benchmarks/bglock_open_questions.md §4.1/§4.2). SPAG_CONF_DECAY / SPAG_CONF_FLOOR expose
