@@ -2524,19 +2524,30 @@ def segment_with_flows(
     # Fragments of ONE object are often spatially DISJOINT (why merge_gap_px
     # failed): high containment is one dup signal, a small persistent GAP is
     # the other (the one that fires on MattSwift). Flag on EITHER signal.
-    dup_gap_thresh = float(os.environ.get("SPAG_TRACK_DEDUP_GAP", "40"))
-    dup_overlap_thresh = float(os.environ.get("SPAG_TRACK_DEDUP_OVERLAP", "0.6"))
+    # SPAG_TRACK_DEDUP_PROFILE picks all 5 thresholds below at once -- no
+    # individual per-threshold override anymore (removed 2026-09-04 to cut
+    # flag count; see docs/SPAG_ENV_FLAGS.md). Only "default" is
+    # production-validated (it's the prior individual defaults, unchanged);
+    # "strict"/"loose" are directional presets, not yet benchmarked.
+    _dedup_profiles = {
+        "strict": {"GAP": 20.0, "OVERLAP": 0.75, "SIZE_RATIO": 0.5, "MIN_COOCCUR": 3, "IDX_TOL": 2},
+        "default": {"GAP": 40.0, "OVERLAP": 0.6, "SIZE_RATIO": 0.3, "MIN_COOCCUR": 2, "IDX_TOL": 3},
+        "loose": {"GAP": 60.0, "OVERLAP": 0.45, "SIZE_RATIO": 0.2, "MIN_COOCCUR": 1, "IDX_TOL": 5},
+    }
+    _dedup_base = _dedup_profiles[os.environ.get("SPAG_TRACK_DEDUP_PROFILE", "default")]
+    dup_gap_thresh = _dedup_base["GAP"]
+    dup_overlap_thresh = _dedup_base["OVERLAP"]
     # Guards the text<->flow and text<->text coverage dedups below (NOT the
     # track-vs-track fragment-fusion dedup a few lines down, which must keep
     # fusing very differently-sized fragments of one real object, e.g. a head
     # box and its own wholebody box). See _size_ratio_ok for the forklift/driver
     # bug this closes.
-    dup_size_ratio_thresh = float(os.environ.get("SPAG_TRACK_DEDUP_SIZE_RATIO", "0.3"))
-    min_cooccur = int(os.environ.get("SPAG_TRACK_DEDUP_MIN_COOCCUR", "2"))
+    dup_size_ratio_thresh = _dedup_base["SIZE_RATIO"]
+    min_cooccur = _dedup_base["MIN_COOCCUR"]
     # Ghost tracks rarely share an EXACT frame index (matched_this_frame blocks
     # both from claiming one frame, so they alternate). Match nearest-in-time
     # occurrence within this many decimated-frame steps instead of idx equality.
-    idx_tolerance = int(os.environ.get("SPAG_TRACK_DEDUP_IDX_TOL", "3"))
+    idx_tolerance = _dedup_base["IDX_TOL"]
 
     n_tracks = len(active_tracks)
     dedup_parent = list(range(n_tracks))
