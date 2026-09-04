@@ -123,18 +123,19 @@ of these have been designed or approved, this is not a plan.
 
 - ~~`SPAG_TRACK_DEDUP_*` (5 flags)~~ — **shipped 2026-09-04** as
   `SPAG_TRACK_DEDUP_PROFILE`, see the Track dedup section above.
-- **`SPAG_OCCL_FBGATE` / `SPAG_OCCL_FB_THRESH` / `SPAG_OCCL_MAX_SKIP`** —
-  `FB_THRESH` and `MAX_SKIP` are meaningless unless `FBGATE=1`; could fold
-  into one `SPAG_OCCL_FBGATE=<thresh>,<max_skip>` or keep gate+threshold
-  separate but drop `MAX_SKIP`'s independence. Lower priority than the
-  track-dedup group — only 2 dependent knobs, not 5.
-- **`SPAG_FLOW_EDGE_NEAREST` / `_CONF_PENALTY` / `_ZERO_CONF` / `_THRESH`**
-  — four knobs shaping the same flow-edge-handling behavior in
-  `flow_depth_propagation.py`. Never referenced as a set in any benchmark
-  doc found this session, so unclear whether they're actually tuned
-  together — needs a code read of how they interact before proposing a
-  merge (unlike track-dedup, where the "always tuned together" claim is
-  visible from every script listed in `run_bglock_audit.py`).
+- **Resolved, not a candidate: `SPAG_OCCL_FBGATE` / `_FB_THRESH` /
+  `_MAX_SKIP`** — same gate-plus-dependent-params shape as
+  `SPAG_SINGLE_PASS`/`SPAG_SP_SEAMPAD` below, not a redundant threshold set
+  like track-dedup was. Only 2 dependent knobs; leaving as-is.
+- **Resolved, not a candidate: `SPAG_FLOW_EDGE_NEAREST` / `_CONF_PENALTY` /
+  `_ZERO_CONF`** — read the code comment at
+  `flow_depth_propagation.py:60-77`: these are explicitly documented as
+  "three independent experiments," i.e. mutually exclusive alternative
+  fixes for the same silhouette-bleed bug, not a set meant to be combined
+  or co-tuned. Merging them into one flag would hide that they're
+  alternatives, not settings. `SPAG_FLOW_EDGE_THRESH` is the one genuinely
+  shared parameter (the edge-detection threshold all three read) and stays
+  separate since it's orthogonal to which of the three is active.
 - **`SPAG_SP_SEAMPAD` / `SPAG_SP_COND_SEAMPAD`** — both only matter when
   `SPAG_SINGLE_PASS=1`; already effectively a 3-flag mini-namespace. Not
   worth merging further, but worth naming as an `SPAG_SINGLE_PASS_*`
@@ -143,3 +144,7 @@ of these have been designed or approved, this is not a plan.
   `SPAG_SAM3_SCALE` — these interact (see notes above) but are genuinely
   orthogonal levers (precision vs. two different resolution mechanisms),
   not duplicates of the same knob.
+
+No further consolidation candidates remain open as of 2026-09-04: every
+group of 3+ flags in this file has now been either merged
+(`SPAG_TRACK_DEDUP_PROFILE`) or explicitly ruled out with a stated reason.
