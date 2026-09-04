@@ -622,26 +622,16 @@ def run_video(
             # (same infer_pair); the cost is dropped seam-crossing propagation,
             # which bg-lock doesn't rely on.
             sp_seam = int(os.environ.get("SPAG_SP_SEAMPAD", "0"))
-            # Decoupled-pass fix (opt-in, dead end -- see C1): redo flow at
-            # flow_seam_pad for propagation only. Functionally perfect but +15%
-            # slower than baseline, erasing single_pass's whole time win.
-            fix_seam_gap = (
-                os.environ.get("SPAG_SP_FIX_SEAMGAP", "0") == "1"
-                and sp_seam != flow_seam_pad
-            )
-            # P4 conditional variant of fix_seam_gap -- CONFIRMED DEAD END
-            # 2026-07-27, kept as scaffolding only. Seam padding isn't local
-            # (pads the whole frame into WAFT), so recomputing only near-seam
-            # pairs doesn't recover baseline; see D1 Priority 4.
+            # P4 conditional seam-padding -- still the only unexplored avenue
+            # for single_pass's seam regression, see D1 Priority 4 / C1.
             cond_seam = (
                 os.environ.get("SPAG_SP_COND_SEAMPAD", "0") == "1"
                 and sp_seam != flow_seam_pad
-                and not fix_seam_gap
             )
             seam_band = flow_seam_pad  # px from each vertical edge (at waft res)
             Hw, Ww = waft_frames.shape[1], waft_frames.shape[2]
             flow_masks = np.zeros((len(waft_frames), Hw, Ww), dtype=np.uint8)
-            print(f"[SPAG4D] Single-pass WAFT (seam_pad={sp_seam}, fix_seam_gap={fix_seam_gap}, "
+            print(f"[SPAG4D] Single-pass WAFT (seam_pad={sp_seam}, "
                   f"cond_seampad={cond_seam}): bidirectional flow + derived SAM mask...")
             t0 = time.time()
             n_seam_recompute = 0
@@ -650,7 +640,7 @@ def run_video(
                 mag = np.sqrt(ff[..., 0] ** 2 + ff[..., 1] ** 2)
                 mask_i = (mag > 0.5).astype(np.uint8) * 255
                 flow_masks[i] = mask_i
-                need_pad = fix_seam_gap
+                need_pad = False
                 if cond_seam and seam_band > 0:
                     # moving foreground within `seam_band` px of either vertical edge?
                     if mask_i[:, :seam_band].any() or mask_i[:, -seam_band:].any():
@@ -2591,9 +2581,6 @@ def segment_with_flows(
             mean_ov = sum(_containment(ba, bb) for ba, bb in pairs) / len(pairs)
             mean_gap = sum(_gap(ba, bb) for ba, bb in pairs) / len(pairs)
             if mean_ov >= dup_overlap_thresh or mean_gap <= dup_gap_thresh:
-                if os.environ.get("SPAG_TRACK_DEDUP_DEBUG", "0") == "1":
-                    print(f"[Track dedup][dbg] obj{active_tracks[a]['obj_id']} vs obj{active_tracks[b]['obj_id']}: "
-                          f"{len(pairs)} matched pairs, mean overlap={mean_ov:.3f}, mean gap={mean_gap:.1f}px -> DUP")
                 _dedup_union(a, b)
 
     # Second signal: re-identification via anchor proximity. A track that
@@ -2622,10 +2609,6 @@ def segment_with_flows(
                     spatial_gap = _gap(sa['box'], sb['box'])
                     spatial_ov = _containment(sa['box'], sb['box'])
                     if spatial_ov >= dup_overlap_thresh or spatial_gap <= dup_gap_thresh:
-                        if os.environ.get("SPAG_TRACK_DEDUP_DEBUG", "0") == "1":
-                            print(f"[Track dedup][dbg] obj{active_tracks[a]['obj_id']} <-> obj{active_tracks[b]['obj_id']}: "
-                                  f"reid anchor gap={time_gap} decimated frames, "
-                                  f"overlap={spatial_ov:.3f}, gap={spatial_gap:.1f}px -> DUP")
                         _dedup_union(a, b)
                         break
                 else:
@@ -3161,42 +3144,6 @@ def segment_with_flows(
             mask_writer.write(mask_frames_by_idx[_fi])
         mask_writer.release()
         reencode_h264(str(output_path / 'sam3_masks_preview.mp4'))
-
-    # Opt-in per-object mask-persistence dump (SPAG_OCCL_MASKDUMP=<path.json>):
-    # records, per tracked obj_id, the non-empty-mask coverage fraction over the
-    # frames it should be present in -- the per-track signal aggregate depth
-    # metrics can't isolate (used to compare the occlusion FB-gate off vs on).
-    _maskdump = os.environ.get("SPAG_OCCL_MASKDUMP")
-    if _maskdump:
-        import json
-        per_obj: dict = {}
-        for _fi, _objs in outputs_per_frame.items():
-            for _oid, _m in _objs.items():
-                area = int(np.count_nonzero(_m))
-                d = per_obj.setdefault(int(_oid), {})
-                d[int(_fi)] = area
-        summary = {}
-        for oid, framemap in per_obj.items():
-            areas = np.array(sorted(framemap.items()))  # (n,2): frame, area
-            present = areas[:, 1] > 0
-            n = len(areas)
-            n_present = int(present.sum())
-            # longest contiguous present run (by tracked-frame order)
-            best = cur = 0
-            for p in present:
-                cur = cur + 1 if p else 0
-                best = max(best, cur)
-            nz = areas[present, 1]
-            summary[oid] = dict(
-                n_frames=n, n_present=n_present,
-                coverage=n_present / n if n else 0.0,
-                longest_present_run=int(best),
-                mean_area=float(nz.mean()) if nz.size else 0.0,
-                area_cv=float(nz.std() / nz.mean()) if nz.size and nz.mean() > 0 else 0.0,
-            )
-        with open(_maskdump, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"[SPAG4D] Per-object mask persistence dumped to {_maskdump} ({len(summary)} objects)")
 
     return outputs_per_frame
 
