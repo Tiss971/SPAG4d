@@ -16,8 +16,8 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from spag4d.core import SPAG4D
-from spag4d.video import run_video
+from spag4d.pipeline.core import SPAG4D
+from spag4d.pipeline.video import run_video
 
 KWARGS = dict(
     skip_step=2,

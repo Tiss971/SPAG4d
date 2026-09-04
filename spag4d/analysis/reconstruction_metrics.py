@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from spag4d.flow_depth_propagation import warp_backward
+from spag4d.depth.flow_depth_propagation import warp_backward
 
 # Foreground silhouette edges are where flow-warp disagreement is EXPECTED
 # (occlusion/dis-occlusion as a moving object's boundary reveals/hides

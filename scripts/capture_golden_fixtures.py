@@ -47,8 +47,8 @@ from pathlib import Path
 
 os.environ["SPAG_DETERMINISTIC"] = "1"
 
-from spag4d.core import SPAG4D  # noqa: E402
-from spag4d.video import run_video  # noqa: E402
+from spag4d.pipeline.core import SPAG4D  # noqa: E402
+from spag4d.pipeline.video import run_video  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_CLIPS_DIR = REPO_ROOT / "tests" / "fixtures" / "clips"

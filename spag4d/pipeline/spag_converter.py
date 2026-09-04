@@ -16,8 +16,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .scene_filter import SkyMode, filter_gaussian_candidates
-from .spherical_grid import create_spherical_grid, rotation_matrix_to_quaternion
+from ..depth.scene_filter import SkyMode, filter_gaussian_candidates
+from ..geometry.spherical_grid import create_spherical_grid, rotation_matrix_to_quaternion
 
 
 @dataclass

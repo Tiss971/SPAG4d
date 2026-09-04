@@ -83,8 +83,8 @@ def run_single(video_name: str):
     import numpy as np
     import torch
 
-    from spag4d.core import SPAG4D
-    from spag4d.video import run_video
+    from spag4d.pipeline.core import SPAG4D
+    from spag4d.pipeline.video import run_video
 
     video_path = VIDEO_DIR / f"{video_name}.mp4"
     out_dir = OUTPUT_BASE / CONFIG_NAME / video_name

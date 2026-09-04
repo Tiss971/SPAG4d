@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from spag4d.core import SPAG4D
-from spag4d.video import run_video
+from spag4d.pipeline.core import SPAG4D
+from spag4d.pipeline.video import run_video
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 CLIPS_DIR = FIXTURES_DIR / "clips"

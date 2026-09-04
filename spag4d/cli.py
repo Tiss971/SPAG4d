@@ -325,7 +325,7 @@ def download_models(model: str, verify: bool):
         try:
             from huggingface_hub import snapshot_download
 
-            from spag4d.pager_model import PAGER_CACHE_DIR, PAGER_REPO
+            from spag4d.generators.pager_model import PAGER_CACHE_DIR, PAGER_REPO
             click.echo("Downloading PaGeR weights (prs-eth/PaGeR, ~5.7GB, CC BY-NC 4.0 non-commercial)...")
             path = snapshot_download(PAGER_REPO, cache_dir=str(PAGER_CACHE_DIR))
             click.echo(f"PaGeR weights cached at: {path}")

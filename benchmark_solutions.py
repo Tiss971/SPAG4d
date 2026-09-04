@@ -25,8 +25,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from spag4d.core import SPAG4D
-from spag4d.video import run_video
+from spag4d.pipeline.core import SPAG4D
+from spag4d.pipeline.video import run_video
 
 DEFAULT_VIDEO_DIR = "/raid/mb273924/_DATASETS/uptale/data/videos"
 

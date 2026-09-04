@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from spag4d.video import (
+from spag4d.pipeline.video import (
     _activity_mask_from_std,
     _estimate_scale_shift,
     _fit_outlier_cap,

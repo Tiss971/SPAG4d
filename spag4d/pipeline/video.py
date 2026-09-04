@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+# Non-portable boundary: sam3 is the vendored third_party/sam3 fork, repo-specific.
 from sam3.model_builder import build_sam3_video_predictor
 from sam3.visualization_utils import (
     prepare_masks_for_visualization,
@@ -22,8 +23,8 @@ from sam3.visualization_utils import (
 )
 
 from .core import SPAG4D, ConversionResult
-from .detect_opticalflow import WAFTWrapper, abs_to_rel_coords
-from .flow_depth_propagation import (
+from ..motion.detect_opticalflow import WAFTWrapper, abs_to_rel_coords
+from ..depth.flow_depth_propagation import (
     composite_bg_locked,
     composite_bg_locked_torch,
     compute_bidirectional_flow,
@@ -31,9 +32,9 @@ from .flow_depth_propagation import (
     feather_dynamic_mask,
     upscale_flow,
 )
-from .ply_writer import save_ply_gsplat
-from .progress import log_tqdm as tqdm
-from .scene_analysis import compute_scene_defaults
+from ..geometry.ply_writer import save_ply_gsplat
+from ..progress import log_tqdm as tqdm
+from ..analysis.scene_analysis import compute_scene_defaults
 
 
 def reencode_h264(src: str) -> str:
@@ -1684,7 +1685,7 @@ def run_video(
 
     depth_reproj_consistency = None
     if depth_npy_dir is not None:
-        from spag4d.reconstruction_metrics import compute_depth_reprojection_consistency
+        from spag4d.analysis.reconstruction_metrics import compute_depth_reprojection_consistency
         depth_reproj_consistency = compute_depth_reprojection_consistency(depth_npy_dir)
         if depth_reproj_consistency is not None:
             print(f"[SPAG4D] depth reprojection consistency: bg_mean_err="

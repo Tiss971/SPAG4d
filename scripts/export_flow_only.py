@@ -31,8 +31,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from spag4d.detect_opticalflow import WAFTWrapper
-from spag4d.flow_depth_propagation import (
+from spag4d.motion.detect_opticalflow import WAFTWrapper
+from spag4d.depth.flow_depth_propagation import (
     crop_horizontal,
     pad_circular_horizontal,
     upscale_flow,

@@ -95,19 +95,19 @@ make_release.py
 python_embed/
 
 # Cloned model repos (not submodules)
-spag4d/panda_arch/PanDA/
-spag4d/da360_arch/DA360/
+spag4d/generators/panda_arch/PanDA/
+spag4d/generators/da360_arch/DA360/
 
 # Dependencies (Local)
 ml-sharp/
-!spag4d/sharp_arch/ml-sharp/
+!spag4d/generators/sharp_arch/ml-sharp/
 
 # Removed v1 submodule (root-level only); keep the vendored PaGeR src/ tracked
 src/
-!spag4d/pager_arch/PaGeR/src/
-!spag4d/pager_arch/PaGeR/src/**
+!spag4d/generators/pager_arch/PaGeR/src/
+!spag4d/generators/pager_arch/PaGeR/src/**
 # ...but never the bytecode caches inside it
-spag4d/pager_arch/PaGeR/src/**/__pycache__/
+spag4d/generators/pager_arch/PaGeR/src/**/__pycache__/
 
 # Large binary test data
 TestImage/*.npy

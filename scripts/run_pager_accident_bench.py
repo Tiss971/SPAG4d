@@ -20,8 +20,8 @@ from pathlib import Path
 
 import torch
 
-from spag4d.core import SPAG4D
-from spag4d.video import run_video
+from spag4d.pipeline.core import SPAG4D
+from spag4d.pipeline.video import run_video
 
 BASE_KWARGS = dict(
     skip_step=4,

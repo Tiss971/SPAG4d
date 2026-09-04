@@ -37,7 +37,7 @@ def main() -> None:
     ap.add_argument("--metric", action="store_true", help="use the metric scale head")
     args = ap.parse_args()
 
-    from spag4d.pager_model import PaGeRModel
+    from spag4d.generators.pager_model import PaGeRModel
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pano = Path(args.pano)
