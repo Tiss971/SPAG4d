@@ -20,27 +20,12 @@ Status legend:
 | Flag | Default | Status | Notes |
 |---|---|---|---|
 | `SPAG_LOCK_ACTIVITY` | `1` | default-on | Bg-lock composite keys off `sam_mask` alone, not the fused SAM\|activity mask. Shipped 2026-07-28, see project CLAUDE.md. |
-| `SPAG_BGLOCK_NOFLOW` | `1` | default-on | Skips flow-warp depth propagation in bg-lock (blends prev+aligned depth instead). Default flipped 2026-09-04: benchmarked faster (-14/-19% time) and better fg_depth_cv (-20/-38%) than flow-warp on 2 motion clips (atelier_1, accident_electrique_02), no measurable bg_depth_cv cost — confirms the code comment's hypothesis that flow-warp worsens the DA360 object-edge halo. Set `=0` to opt back into flow-warp. Not yet validated beyond these 2 clips. |
-| `SPAG_BGLOCK_NOFLOW_BLEND` | `0.5` | opt-in | Blend factor for no-flow bg-lock mode. |
+| `SPAG_BGLOCK_NOFLOW_BLEND` | `0.5` | opt-in | Blend factor for the prev/aligned depth blend used as bg-lock's object-depth input (the only mechanism now — flow-warp propagation was removed, see Deleted flags). |
 | `SPAG_DREF_MIN_SAMPLES` | `0` | opt-in | Min sample threshold for depth-reference. See `docs/bglock_open_questions.md` §5. |
 | `SPAG_HARD_DEPTH_CUTOVER` | `0` | opt-in | Hard cutover mode for depth compositing. See `docs/bglock_open_questions.md` §8.1. |
 | `SPAG_MASK_INJECT` | unset | opt-in | Optional mask injection override path. See `docs/bglock_open_questions.md` §6.3. |
-| `SPAG_COMPOSITE_LOWRES` | `0` | opt-in | Low-res compositing path. |
 | `SPAG_GPU_COMPOSITE` | `1` | default-on | GPU-resident compositing. |
 | `SPAG_DIAG_CSV` | unset | opt-in | Path to write a diagnostics CSV. See `docs/bglock_open_questions.md` §9. |
-
-## Flow-propagation confidence decay (spag4d/flow_depth_propagation.py + video.py)
-
-| Flag | Default | Status | Notes |
-|---|---|---|---|
-| `SPAG_CONF_DECAY` | `0.85` | default-on | Per-pixel confidence decay rate, compounding over a warped age field. Shipped 2026-08-17. |
-| `SPAG_CONF_FLOOR` | `0.5` | default-on | Floor for decayed confidence. |
-| `SPAG_CONF_LEGACY` | `0` | required-for-repro | Restores the pre-2026-08-17 non-compounding confidence-decay behavior. Required to reproduce any benchmark recorded before 2026-08-17 — see CLAUDE.md and `docs/bglock_open_questions.md` §4.1/§4.2. **Not dead, do not delete.** |
-| `SPAG_CONF_HIST` | unset | debug | Path to write confidence-history data. |
-| `SPAG_FLOW_EDGE_NEAREST` | `0` | opt-in | Nearest-neighbor edge handling in flow-based depth propagation. |
-| `SPAG_FLOW_EDGE_CONF_PENALTY` | `0.0` | opt-in | Confidence penalty applied at flow edges. |
-| `SPAG_FLOW_EDGE_ZERO_CONF` | `0` | opt-in | Zeroes confidence at edges. |
-| `SPAG_FLOW_EDGE_THRESH` | `0.15` | opt-in | Relative threshold for edge detection. |
 
 ## Single-pass WAFT / seam padding
 
@@ -89,6 +74,16 @@ run through the golden regression harness on a track-dedup-heavy clip
 | `SPAG_BGLOCK_DILATE_PX` | opt-in, `12` | 2026-09-04. Zero references anywhere outside this doc (no script/benchmark ever set it); hardcoded to `12` as the `bg_lock_dilate_px` kwarg default in `spag4d/video.py`, env override removed. Still tunable via that kwarg for one-off calls. |
 | `SPAG_BGLOCK_FEATHER_PX` | opt-in, `9` | 2026-09-04. Same as above — hardcoded to `9` as the `bg_lock_feather_px` kwarg default, env override removed. |
 | `SPAG_TRACK_REID_MAX_GAP` | opt-in, `40` | 2026-09-04. Zero references outside this doc; hardcoded to `40` in `spag4d/video.py`, env override removed. |
+| `SPAG_BGLOCK_NOFLOW` | default-on, `1` | 2026-09-04. Flow-warp depth propagation itself was deleted (see below), not just defaulted off — the plain prev/aligned blend it flipped to is now the only path, so the flag has nothing left to switch. |
+| `SPAG_COMPOSITE_LOWRES` | opt-in, `0` | 2026-09-04. Only ever gated the flow-warp low-res compositing branch, deleted with it. |
+| `SPAG_CONF_DECAY` | default-on, `0.85` | 2026-09-04. Confidence-decay tracking (`PropagationState`) only existed to support flow-warp propagation; deleted with it. |
+| `SPAG_CONF_FLOOR` | default-on, `0.5` | 2026-09-04. Same as `SPAG_CONF_DECAY` above. |
+| `SPAG_CONF_LEGACY` | required-for-repro, `0` | 2026-09-04. Its prior "do not delete, needed for pre-2026-08-17 repro" protection is now moot: the confidence-decay mechanism itself is gone, so no flag setting can reproduce those benchmarks anymore regardless. |
+| `SPAG_CONF_HIST` | debug | 2026-09-04. Wrote `PropagationState.trace`; deleted with it. |
+| `SPAG_FLOW_EDGE_NEAREST` | opt-in, `0` | 2026-09-04. Edge-handling knob for flow-warp propagation only; deleted with it. |
+| `SPAG_FLOW_EDGE_CONF_PENALTY` | opt-in, `0.0` | 2026-09-04. Same as above. |
+| `SPAG_FLOW_EDGE_ZERO_CONF` | opt-in, `0` | 2026-09-04. Same as above. |
+| `SPAG_FLOW_EDGE_THRESH` | opt-in, `0.15` | 2026-09-04. Same as above. |
 
 ## Occlusion handling (FB-consistency gate)
 
@@ -127,15 +122,9 @@ of these have been designed or approved, this is not a plan.
   `_MAX_SKIP`** — same gate-plus-dependent-params shape as
   `SPAG_SINGLE_PASS`/`SPAG_SP_SEAMPAD` below, not a redundant threshold set
   like track-dedup was. Only 2 dependent knobs; leaving as-is.
-- **Resolved, not a candidate: `SPAG_FLOW_EDGE_NEAREST` / `_CONF_PENALTY` /
-  `_ZERO_CONF`** — read the code comment at
-  `flow_depth_propagation.py:60-77`: these are explicitly documented as
-  "three independent experiments," i.e. mutually exclusive alternative
-  fixes for the same silhouette-bleed bug, not a set meant to be combined
-  or co-tuned. Merging them into one flag would hide that they're
-  alternatives, not settings. `SPAG_FLOW_EDGE_THRESH` is the one genuinely
-  shared parameter (the edge-detection threshold all three read) and stays
-  separate since it's orthogonal to which of the three is active.
+- ~~`SPAG_FLOW_EDGE_NEAREST` / `_CONF_PENALTY` / `_ZERO_CONF` /
+  `_THRESH`~~ — moot, **deleted 2026-09-04** along with the flow-warp
+  propagation code they gated. See Deleted flags above.
 - **`SPAG_SP_SEAMPAD` / `SPAG_SP_COND_SEAMPAD`** — both only matter when
   `SPAG_SINGLE_PASS=1`; already effectively a 3-flag mini-namespace. Not
   worth merging further, but worth naming as an `SPAG_SINGLE_PASS_*`

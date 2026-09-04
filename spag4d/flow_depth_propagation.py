@@ -1,84 +1,27 @@
 # spag4d/flow_depth_propagation.py
 """
-Flow-based depth propagation for a FIXED equirectangular (ERP) 360 camera.
+WAFT optical-flow computation and bg-locked depth compositing for a FIXED
+equirectangular (ERP) 360 camera, used by the bglock depth-correction path
+in video.py.
 
-Alternative/complement to the per-frame affine alignment in video.py
-(`align_depth_frame`). Instead of re-estimating monocular depth from scratch
-every frame and rescaling it to match a static reference, this warps the
-*previous frame's already-stabilized depth* forward using dense optical flow
-(WAFT), and only falls back to monocular depth where the warp cannot be
-trusted (disocclusion, pole singularity, low flow confidence).
+Seam handling: WAFT is a perspective-video flow model with a finite
+correlation search window; it has no notion that column 0 and column W-1
+are adjacent on the sphere. `compute_bidirectional_flow` circularly pads
+the frame pair horizontally before inference (`pad_circular_horizontal`),
+then crops back (`crop_horizontal`), so displacements up to `seam_pad`
+pixels across the seam resolve correctly.
 
-Why this needs ERP-specific handling (camera is FIXED, panorama is ERP):
-  1. Seam wraparound: WAFT is a perspective-video flow model with a finite
-     correlation search window; it has no notion that column 0 and column
-     W-1 are adjacent on the sphere. An object crossing the seam looks like
-     a teleport (huge spurious horizontal flow) unless we give the model
-     wrapped context. We circularly pad the frame pair horizontally before
-     inference, then crop back — this lets local correlation search "see
-     across" the seam for objects that don't move more than `seam_pad`
-     pixels per frame.
-  2. Pole singularity: near the top/bottom rows the ERP mapping is
-     degenerate (a full row of pixels can represent a near-point on the
-     sphere). Small angular motion there produces huge/unstable pixel-space
-     flow, and WAFT was not trained for this distortion. We simply refuse
-     to trust flow propagation within `pole_margin_frac` of the top/bottom
-     edges and always fall back to monocular depth there.
-  3. No global camera motion: because the camera is fixed, static
-     background pixels have ~zero flow everywhere. This means (a) flow is
-     cheap to trust as "no propagation needed" over most of the frame, and
-     (b) any pixel that becomes newly visible (disocclusion) is, by
-     construction, revealed *static background* — so instead of trusting a
-     fresh (possibly scale-drifted) monocular estimate there, we can just
-     read the already-known, artifact-free reference depth D_ref at that
-     pixel.
-  4. Blind spot — pure radial motion: optical flow only captures apparent
-     2D displacement. An object moving directly along the camera ray
-     (towards/away from the fixed camera) has near-zero flow but a real
-     depth change. A pure "replace with warped depth" strategy would freeze
-     such objects at a stale depth. We therefore never fully replace the
-     monocular signal — we blend, weighted by a per-pixel confidence that
-     decays over consecutive propagation steps, so any radial drift gets
-     continuously re-anchored to the (noisier but unbiased) monocular
-     estimate rather than accumulating forever.
-
-This module is intentionally standalone (no SAM3 dependency) so it can be
-prototyped/benchmarked without the full run_video pipeline. Integration
-point in video.py would replace the body of the per-frame loop that calls
-`align_depth_frame` with a call to `propagate_depth_via_flow`, feeding it
-the previous frame's fused mask/depth and this frame's WAFT flow.
+Flow-warp depth propagation (warping the previous frame's depth forward
+along WAFT flow to feed the compositor's object-depth input) was removed
+2026-09-04: benchmarked worse (slower, worse fg_depth_cv) than a plain
+prev/current blend on real clips. See docs/SPAG_ENV_FLAGS.md and
+video.py's bglock compositing loop for the current approach.
 """
-
-import os
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-# Edge-aware propagation at depth discontinuities (silhouette bleed mitigation).
-# The bleed mechanism: at a dynamic-object boundary the true motion field is
-# discontinuous, but WAFT is trained to produce smooth flow, so it interpolates
-# a flow vector that samples neither the foreground nor background correctly;
-# grid_sample's bilinear kernel then blends fg/bg depth across that boundary.
-# FB-consistency alone does not catch this -- a locally-smoothed-but-wrong flow
-# vector can still be self-consistent forward/backward. These three knobs are
-# independent experiments, applied at pixels flagged by a depth-gradient edge
-# mask (computed on depth_prev_final, the source frame's depth, before warping):
-#   SPAG_FLOW_EDGE_NEAREST=1   nearest-sample depth_propagated at edges instead
-#                              of bilinear, so the warp can't invent an averaged
-#                              in-between depth (bilinear elsewhere, unchanged).
-#   SPAG_FLOW_EDGE_CONF_PENALTY=<0..1>  multiply frame_confidence by (1 - w) at
-#                              edges (w = this value), softly distrusting flow
-#                              there beyond what FB-consistency alone catches.
-#   SPAG_FLOW_EDGE_ZERO_CONF=1  force frame_confidence=0 at edges (full
-#                              fallback to depth_curr_affine, the fresh
-#                              monocular estimate, exactly at the boundary).
-_EDGE_NEAREST = os.environ.get("SPAG_FLOW_EDGE_NEAREST", "0") == "1"
-_EDGE_CONF_PENALTY = float(os.environ.get("SPAG_FLOW_EDGE_CONF_PENALTY", "0.0"))
-_EDGE_ZERO_CONF = os.environ.get("SPAG_FLOW_EDGE_ZERO_CONF", "0") == "1"
-_EDGE_REL_THRESH = float(os.environ.get("SPAG_FLOW_EDGE_THRESH", "0.15"))
 
 
 def pad_circular_horizontal(frame: np.ndarray, pad: int) -> np.ndarray:
@@ -158,56 +101,17 @@ def _sample_grid_erp(H: int, W: int, flow: np.ndarray, device) -> torch.Tensor:
     return torch.from_numpy(grid).unsqueeze(0).to(device)  # (1,H,W,2)
 
 
-def depth_edge_mask(depth: np.ndarray, rel_thresh: float = _EDGE_REL_THRESH) -> np.ndarray:
-    """1.0 at pixels sitting on a depth discontinuity (silhouette edge), 0.0
-    elsewhere. Relative central-difference gradient magnitude vs. absolute
-    threshold, so it flags cliffs at any depth scale, not just near ones."""
-    gy, gx = np.gradient(depth)
-    grad_mag = np.sqrt(gx**2 + gy**2)
-    rel_grad = grad_mag / np.maximum(depth, 1e-3)
-    return (rel_grad > rel_thresh).astype(np.float32)
-
-
-def warp_backward(src: np.ndarray, flow: np.ndarray, edge_aware: bool = False) -> np.ndarray:
+def warp_backward(src: np.ndarray, flow: np.ndarray) -> np.ndarray:
     """Backward-warp a single-channel map (e.g. depth) from frame t-1 into
     frame t's pixel grid using flow (t-1 -> t): out(p) = src(p - flow(p)),
     with circular sampling on x (ERP seam) and clamped sampling on y.
-
-    `edge_aware`: at pixels whose SOURCE location sits on a depth
-    discontinuity (see depth_edge_mask), sample nearest instead of bilinear,
-    so the warp can't invent an averaged fg/bg depth across the cliff.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     H, W = src.shape
     grid = _sample_grid_erp(H, W, flow, device)
     src_t = torch.from_numpy(src).float().to(device).view(1, 1, H, W)
-    out_bilinear = F.grid_sample(src_t, grid, mode="bilinear", padding_mode="border", align_corners=True)
-    if not edge_aware:
-        return out_bilinear.view(H, W).cpu().numpy()
-    out_nearest = F.grid_sample(src_t, grid, mode="nearest", padding_mode="border", align_corners=True)
-    edge_t = torch.from_numpy(depth_edge_mask(src)).float().to(device).view(1, 1, H, W)
-    edge_warped = F.grid_sample(edge_t, grid, mode="nearest", padding_mode="border", align_corners=True)
-    is_edge = (edge_warped.view(H, W) > 0.5)
-    out = torch.where(is_edge, out_nearest.view(H, W), out_bilinear.view(H, W))
-    return out.cpu().numpy()
-
-
-def warp_backward_multi(srcs: list[np.ndarray], flow: np.ndarray) -> list[np.ndarray]:
-    """Backward-warp several single-channel maps that share the SAME `flow`
-    (hence the same sampling grid) in one batched grid_sample call. Numerically
-    identical to calling warp_backward() on each source, but builds the grid
-    once and does a single CPU->GPU->CPU transfer instead of one per source."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    H, W = srcs[0].shape
-    grid = _sample_grid_erp(H, W, flow, device)  # (1,H,W,2)
-    n = len(srcs)
-    src_t = torch.from_numpy(np.stack(srcs, axis=0)).float().to(device).view(n, 1, H, W)
-    out = F.grid_sample(
-        src_t, grid.expand(n, -1, -1, -1), mode="bilinear",
-        padding_mode="border", align_corners=True,
-    )
-    out = out.view(n, H, W).cpu().numpy()
-    return [out[i] for i in range(n)]
+    out = F.grid_sample(src_t, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    return out.view(H, W).cpu().numpy()
 
 
 def fb_consistency_error(flow_fwd: np.ndarray, flow_bwd: np.ndarray) -> np.ndarray:
@@ -221,26 +125,6 @@ def fb_consistency_error(flow_fwd: np.ndarray, flow_bwd: np.ndarray) -> np.ndarr
     err_x = flow_fwd[..., 0] + warped_bwd_x
     err_y = flow_fwd[..., 1] + warped_bwd_y
     return np.sqrt(err_x**2 + err_y**2)
-
-
-_POLE_MASK_CACHE: dict = {}  # (H, W, pole_margin_frac) -> constant pole-trust mask
-
-
-def pole_trust_mask(H: int, W: int, pole_margin_frac: float = 0.08) -> np.ndarray:
-    """1.0 in the trustworthy latitude band, 0.0 within `pole_margin_frac` of
-    top/bottom rows where ERP distortion makes flow unreliable. Cached: it only
-    depends on (H, W, pole_margin_frac), all constant across a clip."""
-    key = (H, W, pole_margin_frac)
-    m = _POLE_MASK_CACHE.get(key)
-    if m is not None:
-        return m
-    margin = int(H * pole_margin_frac)
-    mask = np.ones((H, W), dtype=np.float32)
-    if margin > 0:
-        mask[:margin, :] = 0.0
-        mask[H - margin :, :] = 0.0
-    _POLE_MASK_CACHE[key] = mask
-    return mask
 
 
 def feather_dynamic_mask(
@@ -315,341 +199,6 @@ def composite_bg_locked(
     else:
         depth_final = safe_alpha * object_depth + (1.0 - safe_alpha) * safe_ref
     return np.clip(depth_final, 0.0, None), alpha
-
-
-@dataclass
-class PropagationState:
-    """Carries the per-pixel confidence decay across frames so radial motion
-    (invisible to flow) gets continuously re-anchored to monocular depth.
-
-    State is an *age* field — frames elapsed since a pixel was last re-anchored
-    to the fresh monocular estimate — rather than a raw confidence. Confidence
-    is then `decay ** age`, floored at `conf_floor`. Two reasons (see
-    benchmarks/bglock_open_questions.md §4.1/§4.2):
-
-      - Age makes the decay actually compound. The previous scheme stored a
-        confidence that was reset to 1.0 on every trusted frame, so
-        `min(frame_conf, prev * decay)` could only ever take the values
-        {0.0, 0.85}: `decay` was a fixed blend weight, not a decay, and the
-        advertised "radial drift is continuously re-anchored" never happened.
-      - Age is a property of a *surface point*, so it is warped along the flow
-        with the depth it belongs to (§4.2), instead of being read at the
-        stale grid position.
-
-    `conf_floor` stops the exponential from running to zero (which would
-    disable propagation entirely after a few dozen frames and bring back the
-    foreground flicker bglock exists to remove). Steady state is a first-order
-    low-pass: each frame mixes `1 - conf_floor` of fresh monocular depth in, so
-    accumulated radial drift is bounded by a geometric series instead of
-    growing without limit — and it does so smoothly, with no periodic
-    full-re-anchor pop.
-    """
-
-    confidence: np.ndarray | None = None  # (H, W) last frame's running_confidence (diagnostic; input only in legacy mode)
-    age: np.ndarray | None = None  # (H, W) frames since last re-anchor, warped along the flow
-    decay: float = 0.85  # confidence multiplier per consecutive propagation step
-    conf_floor: float = 0.5  # confidence never decays below this (see above)
-    legacy: bool = False  # SPAG_CONF_LEGACY=1: pre-2026-08-17 non-compounding behaviour
-    trace: list | None = None  # opt-in per-frame running_confidence stats (SPAG_CONF_HIST)
-
-    def age_cap(self) -> float:
-        """Age beyond which `decay ** age` is already below `conf_floor`, so the
-        value is saturated. Clamping there keeps the field finite and inspectable."""
-        if self.conf_floor <= 0.0 or not (0.0 < self.decay < 1.0):
-            return 1e4
-        return float(np.ceil(np.log(self.conf_floor) / np.log(self.decay))) + 1.0
-
-
-def _conf_stats(rc, age) -> dict:
-    """Per-frame running_confidence / age summary for SPAG_CONF_HIST. Works on
-    numpy arrays (cpu path) and cuda tensors (gpu path) alike."""
-    is_t = isinstance(rc, torch.Tensor)
-    uniq = torch.unique(rc) if is_t else np.unique(rc)
-    stats = {
-        "frac_zero": float((rc == 0).mean() if not is_t else (rc == 0).float().mean()),
-        "frac_lt_0.5": float((rc < 0.5).mean() if not is_t else (rc < 0.5).float().mean()),
-        "mean": float(rc.mean()),
-        "n_distinct": int(uniq.numel() if is_t else uniq.size),
-        "distinct": sorted(float(v) for v in (uniq.tolist() if is_t else uniq.ravel().tolist()))[:8],
-    }
-    if age is not None:
-        stats["age_mean"] = float(age.mean())
-        stats["age_max"] = float(age.max())
-    return stats
-
-
-def propagate_depth_via_flow(
-    depth_prev_final: np.ndarray,
-    depth_curr_affine: np.ndarray,
-    depth_ref: np.ndarray,
-    flow_fwd: np.ndarray,
-    flow_bwd: np.ndarray,
-    state: PropagationState,
-    fb_err_threshold: float = 1.5,
-    pole_margin_frac: float = 0.08,
-    disocclusion_mask: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    """
-    Produce this frame's depth by blending:
-      - depth_propagated = warp(depth_prev_final, flow_fwd)   [trusted where flow is good]
-      - depth_ref                                              [trusted for newly-revealed
-                                                                  static background, since the
-                                                                  camera is fixed]
-      - depth_curr_affine                                      [fallback: fresh monocular
-                                                                  estimate, current pipeline]
-
-    Returns:
-        depth_final, confidence_map (H,W) in [0,1], debug dict with the raw
-        FB-error / trust masks (useful for tuning thresholds).
-    """
-    H, W = depth_curr_affine.shape
-
-    # depth propagation, the two FB-consistency warps and the age field all
-    # backward-warp along the SAME flow_fwd, so batch them into one grid_sample
-    # (identical result). Age rides along at no extra grid_sample: it describes
-    # the surface point, so it must be sampled at p - flow(p) like the depth.
-    to_warp = [flow_bwd[..., 0], flow_bwd[..., 1]]
-    warp_age = state.age is not None and not state.legacy
-    if warp_age:
-        to_warp.append(state.age)
-    warped = warp_backward_multi(to_warp, flow_fwd)
-    warped_bwd_x, warped_bwd_y = warped[0], warped[1]
-    age_prev = warped[2] if warp_age else None
-    depth_propagated = warp_backward(depth_prev_final, flow_fwd, edge_aware=_EDGE_NEAREST)
-    err_x = flow_fwd[..., 0] + warped_bwd_x
-    err_y = flow_fwd[..., 1] + warped_bwd_y
-    fb_err = np.sqrt(err_x**2 + err_y**2)
-    fb_trust = (fb_err < fb_err_threshold).astype(np.float32)
-    pole_trust = pole_trust_mask(H, W, pole_margin_frac)
-
-    frame_confidence = fb_trust * pole_trust
-
-    if _EDGE_CONF_PENALTY > 0 or _EDGE_ZERO_CONF:
-        edge_src = depth_edge_mask(depth_prev_final)
-        edge_warped = warp_backward(edge_src, flow_fwd) > 0.5
-        if _EDGE_ZERO_CONF:
-            frame_confidence = np.where(edge_warped, 0.0, frame_confidence)
-        elif _EDGE_CONF_PENALTY > 0:
-            frame_confidence = np.where(
-                edge_warped, frame_confidence * (1.0 - _EDGE_CONF_PENALTY), frame_confidence
-            )
-
-    age = None
-    if state.legacy:
-        if state.confidence is None:
-            running_confidence = frame_confidence
-        else:
-            running_confidence = np.minimum(frame_confidence, state.confidence * state.decay)
-    else:
-        # Age since last re-anchor: +1 wherever we keep propagating, reset to 0
-        # wherever this frame's flow is untrusted (that pixel takes the fresh
-        # monocular estimate / D_ref below, i.e. it *is* re-anchored).
-        prev = 0.0 if age_prev is None else age_prev
-        age = np.where(frame_confidence > 0, prev + 1.0, 0.0).astype(np.float32)
-        age = np.clip(age, 0.0, state.age_cap())
-        running_confidence = frame_confidence * np.maximum(
-            state.conf_floor, state.decay**age
-        ).astype(np.float32)
-
-    # Disocclusion: pixels flagged unreliable by FB-consistency that are NOT
-    # inside the (previous) dynamic-object mask are revealed static
-    # background -> use D_ref directly instead of noisy fresh monocular depth.
-    depth_final = (
-        running_confidence * depth_propagated + (1.0 - running_confidence) * depth_curr_affine
-    )
-    if disocclusion_mask is not None:
-        # Gate on frame_confidence, not on `running_confidence < 0.5`: the latter
-        # was only ever equivalent to "== 0" and now depends on conf_floor, which
-        # is a tuning knob and must not silently move the reveal set.
-        reveal = (frame_confidence == 0) & (disocclusion_mask == 0)
-        depth_final = np.where(reveal, depth_ref, depth_final)
-
-    depth_final = np.clip(depth_final, 0.0, None)
-
-    if state.trace is not None:
-        state.trace.append(_conf_stats(running_confidence, age))
-    state.age = age
-    # Legacy input path; otherwise kept purely as a diagnostic of the last frame.
-    state.confidence = (
-        np.where(frame_confidence > 0, 1.0, running_confidence)
-        if state.legacy
-        else running_confidence
-    )
-
-    debug = {
-        "fb_err": fb_err,
-        "fb_trust": fb_trust,
-        "pole_trust": pole_trust,
-        "confidence": running_confidence,
-        "age": age,
-        "depth_propagated": depth_propagated,
-    }
-    return depth_final, running_confidence, debug
-
-
-# ---------------------------------------------------------------------------
-# Torch/GPU-native variants
-# ---------------------------------------------------------------------------
-# These keep the whole depth-propagation chain resident on the GPU (depth is
-# born there from DA360), avoiding the per-call numpy<->cuda round-trips of the
-# numpy path above. Numerically equivalent up to float reduction order (GPU
-# sums differ from numpy at ~1e-6 relative), not byte-identical. Used by the
-# bglock fast-path in video.run_video; the numpy versions remain for other
-# configs and standalone benchmarking.
-
-_BASE_GRID_CACHE_T: dict = {}  # (H, W, device) -> (ys, xs) float32 cuda meshgrid
-_POLE_MASK_CACHE_T: dict = {}  # (H, W, pole_margin_frac, device) -> pole mask cuda
-
-
-def _base_meshgrid_torch(H: int, W: int, device):
-    key = (H, W, str(device))
-    g = _BASE_GRID_CACHE_T.get(key)
-    if g is None:
-        ys, xs = torch.meshgrid(
-            torch.arange(H, device=device, dtype=torch.float32),
-            torch.arange(W, device=device, dtype=torch.float32),
-            indexing="ij",
-        )
-        g = (ys, xs)
-        _BASE_GRID_CACHE_T[key] = g
-    return g
-
-
-def _pole_trust_mask_torch(H: int, W: int, pole_margin_frac: float, device):
-    key = (H, W, pole_margin_frac, str(device))
-    m = _POLE_MASK_CACHE_T.get(key)
-    if m is not None:
-        return m
-    margin = int(H * pole_margin_frac)
-    mask = torch.ones((H, W), dtype=torch.float32, device=device)
-    if margin > 0:
-        mask[:margin, :] = 0.0
-        mask[H - margin :, :] = 0.0
-    _POLE_MASK_CACHE_T[key] = mask
-    return mask
-
-
-def _sample_grid_erp_torch(H: int, W: int, flow: torch.Tensor) -> torch.Tensor:
-    """Torch equivalent of _sample_grid_erp: backward-warp source coords
-    p - flow(p), wrapped mod W on x (seam) and clamped on y (poles)."""
-    ys, xs = _base_meshgrid_torch(H, W, flow.device)
-    src_x = torch.remainder(xs - flow[..., 0], W)
-    src_y = torch.clamp(ys - flow[..., 1], 0, H - 1)
-    grid_x = (src_x / (W - 1)) * 2.0 - 1.0
-    grid_y = (src_y / (H - 1)) * 2.0 - 1.0
-    return torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # (1,H,W,2)
-
-
-def warp_backward_multi_torch(srcs: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
-    """Backward-warp several single-channel maps (srcs: (n,H,W)) that share the
-    same `flow` (H,W,2) in one batched grid_sample. Returns (n,H,W)."""
-    n, H, W = srcs.shape
-    grid = _sample_grid_erp_torch(H, W, flow)  # (1,H,W,2)
-    out = F.grid_sample(
-        srcs.unsqueeze(1), grid.expand(n, -1, -1, -1),
-        mode="bilinear", padding_mode="border", align_corners=True,
-    )
-    return out.squeeze(1)
-
-
-def _depth_edge_mask_torch(depth: torch.Tensor, rel_thresh: float = _EDGE_REL_THRESH) -> torch.Tensor:
-    """Torch equivalent of depth_edge_mask: 1.0 at depth-discontinuity pixels."""
-    gy = torch.zeros_like(depth)
-    gx = torch.zeros_like(depth)
-    gy[1:-1, :] = (depth[2:, :] - depth[:-2, :]) * 0.5
-    gx[:, 1:-1] = (depth[:, 2:] - depth[:, :-2]) * 0.5
-    grad_mag = torch.sqrt(gx * gx + gy * gy)
-    rel_grad = grad_mag / torch.clamp(depth, min=1e-3)
-    return (rel_grad > rel_thresh).float()
-
-
-def _warp_backward_torch_nearest(src: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
-    H, W = src.shape
-    grid = _sample_grid_erp_torch(H, W, flow)
-    out = F.grid_sample(
-        src.view(1, 1, H, W), grid, mode="nearest", padding_mode="border", align_corners=True,
-    )
-    return out.view(H, W)
-
-
-def propagate_depth_via_flow_torch(
-    depth_prev_final: torch.Tensor,
-    depth_curr_affine: torch.Tensor,
-    depth_ref: torch.Tensor,
-    flow_fwd: torch.Tensor,
-    flow_bwd: torch.Tensor,
-    state: PropagationState,
-    fb_err_threshold: float = 1.5,
-    pole_margin_frac: float = 0.08,
-    disocclusion_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """GPU-native equivalent of propagate_depth_via_flow. All tensors are
-    (H,W) float32 cuda (flows (H,W,2), disocclusion_mask (H,W) any numeric).
-    Returns depth_final (H,W); state.confidence carries forward as a tensor."""
-    H, W = depth_curr_affine.shape
-    # Age rides along in the same batched warp as the depth (§4.2: it describes a
-    # surface point, so it must be sampled at p - flow(p)), at no extra grid_sample.
-    warp_age = state.age is not None and not state.legacy
-    to_warp = [depth_prev_final, flow_bwd[..., 0], flow_bwd[..., 1]]
-    if warp_age:
-        to_warp.append(state.age)
-    warped = warp_backward_multi_torch(torch.stack(to_warp, dim=0), flow_fwd)
-    depth_propagated = warped[0]
-    err_x = flow_fwd[..., 0] + warped[1]
-    err_y = flow_fwd[..., 1] + warped[2]
-    fb_err = torch.sqrt(err_x**2 + err_y**2)
-    fb_trust = (fb_err < fb_err_threshold).float()
-    pole_trust = _pole_trust_mask_torch(H, W, pole_margin_frac, depth_curr_affine.device)
-    frame_confidence = fb_trust * pole_trust
-
-    edge_warped = None
-    if _EDGE_NEAREST or _EDGE_CONF_PENALTY > 0 or _EDGE_ZERO_CONF:
-        edge_src = _depth_edge_mask_torch(depth_prev_final)
-        edge_warped = _warp_backward_torch_nearest(edge_src, flow_fwd) > 0.5
-    if _EDGE_NEAREST:
-        depth_propagated_nearest = _warp_backward_torch_nearest(depth_prev_final, flow_fwd)
-        depth_propagated = torch.where(edge_warped, depth_propagated_nearest, depth_propagated)
-    if _EDGE_ZERO_CONF:
-        frame_confidence = torch.where(edge_warped, torch.zeros_like(frame_confidence), frame_confidence)
-    elif _EDGE_CONF_PENALTY > 0:
-        frame_confidence = torch.where(
-            edge_warped, frame_confidence * (1.0 - _EDGE_CONF_PENALTY), frame_confidence
-        )
-
-    age = None
-    if state.legacy:
-        if state.confidence is None:
-            running_confidence = frame_confidence
-        else:
-            running_confidence = torch.minimum(frame_confidence, state.confidence * state.decay)
-    else:
-        prev = warped[3] if warp_age else torch.zeros_like(frame_confidence)
-        age = torch.where(
-            frame_confidence > 0, prev + 1.0, torch.zeros_like(prev)
-        ).clamp_(0.0, state.age_cap())
-        running_confidence = frame_confidence * torch.clamp_min(
-            torch.pow(torch.as_tensor(state.decay, device=age.device), age), state.conf_floor
-        )
-
-    depth_final = (
-        running_confidence * depth_propagated + (1.0 - running_confidence) * depth_curr_affine
-    )
-    if disocclusion_mask is not None:
-        # Gate on frame_confidence, not `running_confidence < 0.5` -- see the
-        # numpy twin for why the old threshold carried no information.
-        reveal = (frame_confidence == 0) & (disocclusion_mask == 0)
-        depth_final = torch.where(reveal, depth_ref, depth_final)
-
-    depth_final = depth_final.clamp_min(0.0)
-    if state.trace is not None:
-        state.trace.append(_conf_stats(running_confidence, age))
-    state.age = age
-    state.confidence = (
-        torch.where(frame_confidence > 0, torch.ones_like(running_confidence), running_confidence)
-        if state.legacy
-        else running_confidence
-    )
-    return depth_final
 
 
 # --- GPU compositing (feather + bg-lock) -----------------------------------

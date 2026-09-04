@@ -24,14 +24,11 @@ from sam3.visualization_utils import (
 from .core import SPAG4D, ConversionResult
 from .detect_opticalflow import WAFTWrapper, abs_to_rel_coords
 from .flow_depth_propagation import (
-    PropagationState,
     composite_bg_locked,
     composite_bg_locked_torch,
     compute_bidirectional_flow,
     fb_consistency_error,
     feather_dynamic_mask,
-    propagate_depth_via_flow,
-    propagate_depth_via_flow_torch,
     upscale_flow,
 )
 from .ply_writer import save_ply_gsplat
@@ -368,8 +365,6 @@ def run_video(
     bg_lock_dilate_px: int = 12,
     bg_lock_feather_px: int = 9,
     flow_seam_pad: int = 64,
-    fb_err_threshold: float = 1.5,
-    pole_margin_frac: float = 0.08,
     unisharp_repo: str | None = "/raid/mb273924/SPAG4d/third_party/UniSHARP",
     unisharp_python: str | None = None,
     unisharp_checkpoint: str | None = "/raid/mb273924/SPAG4d/third_party/UniSHARP/pretained_model.pt",
@@ -998,56 +993,26 @@ def run_video(
     # SPAG_BGLOCK_NOFLOW=1: skip flow-propagation for the dynamic-object depth entirely.
     # Instead of warping depth_prev_final along the WAFT flow field, just blend the
     # previous frame's composited depth with this frame's own affine-aligned depth,
-    # pixel-for-pixel (no per-pixel correspondence). Tests whether the object-depth
-    # halo/ramp traced to DA360's own resolution limit (see docs/ da360 halo investigation,
-    # 2026-08-20) is made worse by flow-warp interpolation, or is unaffected by it.
-    # Default flipped to on 2026-09-04: benchmarked faster (-14/-19%) and
-    # better fg_depth_cv (-20/-38%) than flow-warp on 2 clips with real
-    # dynamic-object motion (atelier_1, accident_electrique_02), no bg cost.
-    # See docs/SPAG_ENV_FLAGS.md. Set SPAG_BGLOCK_NOFLOW=0 to opt back into
-    # flow-warp propagation.
-    _bglock_noflow = os.environ.get("SPAG_BGLOCK_NOFLOW", "1") == "1"
+    # pixel-for-pixel (no per-pixel correspondence). Benchmarked 2026-09-04 against
+    # flow-warp propagation on 2 motion clips (atelier_1, accident_electrique_02):
+    # this blend was faster (-14/-19%) and gave better fg_depth_cv (-20/-38%), no
+    # bg cost -- flow-warp interpolation was making DA360's object-edge halo worse,
+    # not helping it. Flow-warp propagation (propagate_depth_via_flow[_torch],
+    # PropagationState, SPAG_CONF_*/SPAG_FLOW_EDGE_*/SPAG_COMPOSITE_LOWRES) removed
+    # accordingly. See docs/SPAG_ENV_FLAGS.md.
     _bglock_noflow_blend = float(os.environ.get("SPAG_BGLOCK_NOFLOW_BLEND", "0.5"))
-    # Confidence decay now compounds over an age field warped along the flow
-    # (benchmarks/bglock_open_questions.md §4.1/§4.2). SPAG_CONF_DECAY / SPAG_CONF_FLOOR expose
-    # the two constants for sweeping; SPAG_CONF_LEGACY=1 restores the pre-2026-08-17
-    # non-compounding behaviour every benchmark before that date was measured under.
-    flow_state = PropagationState(
-        decay=float(os.environ.get("SPAG_CONF_DECAY", 0.85)),
-        conf_floor=float(os.environ.get("SPAG_CONF_FLOOR", 0.5)),
-        legacy=os.environ.get("SPAG_CONF_LEGACY") == "1",
-    )
-    # SPAG_CONF_HIST=<path.json>: dump per-frame running_confidence stats, to check
-    # whether confidence collapses to zero over a sequence (bglock_open_questions §4.1).
-    conf_hist_path = os.environ.get("SPAG_CONF_HIST")
-    if conf_hist_path or diag_dir is not None:
-        flow_state.trace = []
 
     # GPU-resident depth chain: for the winner hot path (bglock + lstsq align +
-    # median/none smoother) run align, smoothing and flow-propagation on the GPU
-    # (depth is already there from DA360), avoiding the per-frame numpy<->cuda
-    # round-trips. Numerically within float rounding of the numpy path, not
-    # byte-identical. Any other config falls back to the numpy path below.
+    # median/none smoother) run align and compositing on the GPU (depth is already
+    # there from DA360), avoiding the per-frame numpy<->cuda round-trips.
+    # Numerically within float rounding of the numpy path, not byte-identical.
+    # Any other config falls back to the numpy path below.
     gpu_depth_chain = (
         depth_correction == "bglock"
         and alignement_mask not in ("nothing", "all")
         and alignement_method == "lstsq"
         and (depth_smoother is None or depth_smoother.method == "median")
         and torch.cuda.is_available()
-    )
-    # SPAG_COMPOSITE_LOWRES=1: run propagate_depth_via_flow_torch's warp/FB-consistency
-    # math at WAFT working resolution (meta["new_W"]/["new_H"]) instead of native res,
-    # downscaling depth_prev_t/aligned_t/depth_ref_t/lock_t and the flow pair right
-    # before the call and upscaling only the single depth_object_t output back to
-    # native res afterward. Composite (composite_bg_locked*) and all diagnostics
-    # still run at native res, unaffected. Not lossless: full-frame depth RMSE
-    # ~0.20 (PSNR ~46dB) vs native-res compositing, concentrated at dynamic-object
-    # silhouette boundaries (~1.36 RMSE / ~29dB there) -- see
-    # docs/RAM_USAGE_INVESTIGATION_PLAN.md "Composite-at-low-res" section. Opt-in.
-    _composite_lowres = (
-        gpu_depth_chain
-        and os.environ.get("SPAG_COMPOSITE_LOWRES", "0") == "1"
-        and (meta["new_W"], meta["new_H"]) != (meta["W"], meta["H"])
     )
     depth_ref_t = torch.from_numpy(depth_ref_np).to("cuda") if gpu_depth_chain else None
     depth_prev_t = None  # previous frame's composited depth as a cuda tensor
@@ -1326,98 +1291,27 @@ def run_video(
                 foreground_depth_deltas.append(fg_delta)
 
         if depth_correction == "bglock" and alignement_mask != "nothing":
-            # Real SAM3(+activity) dynamic mask -> flow-propagate the object
-            # depth for temporal coherence, then lock every static pixel to
-            # depth_ref_np (fixed camera => zero-variance background) and
-            # blend in the object depth only inside the feathered mask.
+            # Blend the previous frame's composited depth with this frame's own
+            # aligned depth for temporal coherence on dynamic-object pixels, then
+            # lock every static pixel to depth_ref_np (fixed camera => zero-
+            # variance background) and blend in the object depth only inside the
+            # feathered mask. See docs/SPAG_ENV_FLAGS.md for why this replaced
+            # flow-warp propagation.
             depth_object_t = None  # set in the gpu path, reused for gpu composite
             if idx == 0 or depth_prev_final is None:
                 depth_object = aligned_depth_np.copy()
                 if gpu_composite:
                     depth_object_t = aligned_t
-            elif _bglock_noflow:
-                if gpu_depth_chain:
-                    depth_object_t = (
-                        (1.0 - _bglock_noflow_blend) * depth_prev_t
-                        + _bglock_noflow_blend * aligned_t
-                    )
-                    depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
-                else:
-                    depth_object = (
-                        (1.0 - _bglock_noflow_blend) * depth_prev_final
-                        + _bglock_noflow_blend * aligned_depth_np
-                    )
-            elif gpu_depth_chain and _composite_lowres:
-                # Composite-at-low-res: keep flow at WAFT working res (no upscale)
-                # and downscale the other three inputs to match, so the whole
-                # warp/FB-consistency/blend math runs at ~1/14th the pixel count.
-                # Single output upscaled back to native res once.
-                lr_h, lr_w = meta["new_H"], meta["new_W"]
-                flow_fwd_t = torch.from_numpy(flows_fwd[idx - 1]).to("cuda")
-                flow_bwd_t = torch.from_numpy(flows_bwd[idx - 1]).to("cuda")
-                depth_prev_lr = F.interpolate(
-                    depth_prev_t[None, None], size=(lr_h, lr_w), mode="bilinear"
-                )[0, 0]
-                aligned_lr = F.interpolate(
-                    aligned_t[None, None], size=(lr_h, lr_w), mode="bilinear"
-                )[0, 0]
-                depth_ref_lr = F.interpolate(
-                    depth_ref_t[None, None], size=(lr_h, lr_w), mode="bilinear"
-                )[0, 0]
-                lock_lr = F.interpolate(
-                    lock_t[None, None].float(), size=(lr_h, lr_w), mode="nearest"
-                )[0, 0]
-                depth_object_lr_t = propagate_depth_via_flow_torch(
-                    depth_prev_lr,
-                    aligned_lr,
-                    depth_ref_lr,
-                    flow_fwd_t,
-                    flow_bwd_t,
-                    flow_state,
-                    fb_err_threshold=fb_err_threshold,
-                    pole_margin_frac=pole_margin_frac,
-                    disocclusion_mask=lock_lr,
-                )
-                depth_object_t = F.interpolate(
-                    depth_object_lr_t[None, None], size=(meta["H"], meta["W"]), mode="bilinear"
-                )[0, 0]
-                depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
             elif gpu_depth_chain:
-                # flows_fwd/flows_bwd are stored at WAFT working resolution;
-                # propagate_depth_via_flow_torch requires flow and depth at
-                # matching resolution, so upscale lazily here (no-op if
-                # already native res). See population comment above.
-                flow_fwd_native = upscale_flow(flows_fwd[idx - 1], meta["H"], meta["W"])
-                flow_bwd_native = upscale_flow(flows_bwd[idx - 1], meta["H"], meta["W"])
-                flow_fwd_t = torch.from_numpy(flow_fwd_native).to("cuda")
-                flow_bwd_t = torch.from_numpy(flow_bwd_native).to("cuda")
-                depth_object_t = propagate_depth_via_flow_torch(
-                    depth_prev_t,
-                    aligned_t,
-                    depth_ref_t,
-                    flow_fwd_t,
-                    flow_bwd_t,
-                    flow_state,
-                    fb_err_threshold=fb_err_threshold,
-                    pole_margin_frac=pole_margin_frac,
-                    disocclusion_mask=lock_t,
+                depth_object_t = (
+                    (1.0 - _bglock_noflow_blend) * depth_prev_t
+                    + _bglock_noflow_blend * aligned_t
                 )
                 depth_object = None if gpu_composite else depth_object_t.cpu().numpy()
             else:
-                # See gpu_depth_chain branch above: flows_fwd/flows_bwd are
-                # stored at WAFT working resolution, upscale lazily on read.
-                flow_fwd_native = upscale_flow(flows_fwd[idx - 1], meta["H"], meta["W"])
-                flow_bwd_native = upscale_flow(flows_bwd[idx - 1], meta["H"], meta["W"])
-                depth_object, _, _ = propagate_depth_via_flow(
-                    depth_prev_final,
-                    aligned_depth_np,
-                    depth_ref_np,
-                    flow_fwd_native,
-                    flow_bwd_native,
-                    flow_state,
-                    fb_err_threshold=fb_err_threshold,
-                    pole_margin_frac=pole_margin_frac,
-                    disocclusion_mask=lock_mask,
+                depth_object = (
+                    (1.0 - _bglock_noflow_blend) * depth_prev_final
+                    + _bglock_noflow_blend * aligned_depth_np
                 )
             composite_alpha = None  # (H,W) soft object weight, only needed for §9 diagnostics
             if gpu_composite:
@@ -1476,17 +1370,11 @@ def run_video(
             else:
                 flow_med_dx = flow_med_dy = flow_med_mag = float("nan")
 
-            # (d) running_confidence histogram -- reuses flow_state.trace, already
-            # populated above (enabled whenever SPAG_CONF_HIST or SPAG_DIAG_CSV is set).
-            if flow_state.trace:
-                conf_stats = flow_state.trace[-1]
-            else:
-                conf_stats = {}
-            conf_mean = conf_stats.get("mean", float("nan"))
-            conf_frac_zero = conf_stats.get("frac_zero", float("nan"))
-            conf_frac_lt_half = conf_stats.get("frac_lt_0.5", float("nan"))
-            age_mean = conf_stats.get("age_mean", float("nan"))
-            age_max = conf_stats.get("age_max", float("nan"))
+            # (d) running_confidence histogram: dead now that flow-warp propagation
+            # (and its confidence-decay tracking, flow_state) is gone -- columns
+            # kept for CSV schema stability, always NaN.
+            conf_mean = conf_frac_zero = conf_frac_lt_half = float("nan")
+            age_mean = age_max = float("nan")
 
             # (h) depth variance split static/dynamic/feather, as frame-to-frame
             # median delta per region (same pattern as the existing bg/fg deltas
@@ -1638,11 +1526,6 @@ def run_video(
     step_times["depth_loop_estimation"] = depth_estimation_cumtime
     step_times["depth_loop_alignment"] = depth_alignement_cumtime
     step_times["depth_loop_gs_generation"] = gs_generation_cumtime
-
-    if conf_hist_path and flow_state.trace:
-        import json as _json
-        Path(conf_hist_path).write_text(_json.dumps(flow_state.trace, indent=1))
-        print(f"[SPAG4D] confidence trace ({len(flow_state.trace)} frames) -> {conf_hist_path}")
 
     plt.figure(figsize=(12, 5))
     plt.plot(median_depth_fg, marker="o", label="Original", color="orange")

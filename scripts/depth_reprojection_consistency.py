@@ -50,7 +50,7 @@ def main():
         depth = np.load(depth_dir / f"depth_{i}.npy")
         if prev_depth is not None and i in flow_idx and i == prev_i + 1:
             flow = np.load(depth_dir / f"flow_{i}.npy")
-            pred = warp_backward(prev_depth, flow, edge_aware=True)
+            pred = warp_backward(prev_depth, flow)
             err = np.abs(pred - depth)
             rows.append({
                 "frame": i,
