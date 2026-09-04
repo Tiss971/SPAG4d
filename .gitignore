@@ -144,3 +144,10 @@ benchmarks/**
 
 # Re-include light text/log formats
 !benchmarks/**/*.md
+
+# Golden regression fixtures: npy depth/mask/flow arrays are load-bearing for
+# Task 4's per-array diff but too large to commit (native-res per-frame flow
+# dominates, ~3.2GB total across both clips). Only manifest.json (splat_count +
+# vertex_hash) is tracked; npy/ is regenerated locally via
+# scripts/capture_golden_fixtures.py.
+tests/fixtures/golden/*/npy/
