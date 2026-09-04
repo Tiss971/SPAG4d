@@ -2193,7 +2193,7 @@ def segment_with_flows(
     # IndexError from frame-count desync). Not lossless -- coarser input changes
     # SAM3's detections. Built at NATIVE frame count, not waft_frames (which is
     # skip_step-decimated; add_prompt uses native indices -- confirmed IndexError).
-    sam3_scale = float(os.environ.get("SPAG_SAM3_SCALE_DISABLE", "1.0"))
+    sam3_scale = float(os.environ.get("SPAG_SAM3_SCALE", "1.0"))
     sam3_maxsize = int(os.environ.get("SPAG_SAM3_MAXSIZE", "0"))
     if sam3_maxsize > 0:
         # Absolute cap on the longer edge (not a relative scale): only clips above
