@@ -4,7 +4,7 @@ Combine per-config results.json produced by benchmark_solutions.py (possibly run
 as several parallel processes) into one comparison table vs. the baseline.
 
 Usage:
-    python report_solutions.py --dir benchmark_solutions_pager
+    python report_solutions.py --dir benchmark_solutions
 """
 
 import argparse
@@ -70,7 +70,7 @@ def pct_delta(new, base):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", default="benchmark_solutions_pager")
+    ap.add_argument("--dir", default="benchmark_solutions")
     args = ap.parse_args()
     root = Path(args.dir)
 

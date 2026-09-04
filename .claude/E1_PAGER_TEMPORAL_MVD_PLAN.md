@@ -1,8 +1,6 @@
 # E1 — "pager" generator: cubemap + DA3 (MVD) over spatial + temporal windows
 
-_2026-07-31. Design plan, not yet implemented. Written after investigating vipe's own
-MVD/world_lock code to ground the design in what's actually proven to work (and not work)
-there. High-level summary also in `docs/WORK_LOG_DYNAMIC_360_RECONSTRUCTION.md`._
+Written 2026-07-31. **Status: spatial-only pager (`active_generator="pager"`) ships in production; the temporal/MVD batching design below remains unbuilt.**
 
 **Spatial-only already ships**: `spag4d/pager_model.py` (`PaGeRModel`, vendored `prs-eth/PaGeR`
 DA3-Giant) wraps ERP → 6-face cubemap → DA3 → stitched-back ERP depth/normals/sky-mask, wired as
