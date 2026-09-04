@@ -49,8 +49,8 @@ Status legend:
 | `SPAG_HARD_DEPTH_CUTOVER` | `0` | opt-in | Hard cutover mode for depth compositing. See `docs/bglock_open_questions.md` §8.1. |
 | `SPAG_LOCK_ACTIVITY` | `1` | default-on | Bg-lock composite keys off `sam_mask` alone, not the fused SAM|activity mask. Shipped 2026-07-28, see project CLAUDE.md. |
 | `SPAG_MASK_INJECT` | unset | opt-in | Optional mask injection override path. See `docs/bglock_open_questions.md` §6.3. |
-| `SPAG_SAM3_SCALE` | `1.0` | opt-in | Downscale factor for the SAM3 segmentation pass input. Renamed from `SPAG_SAM3_SCALE_DISABLE` in this plan (Task 5) to match its actual usage everywhere else in code comments and docs. Do not combine with `SPAG_SAM3_BF16` — confirmed-deterministic regression, see project CLAUDE.md. |
-| `SPAG_SAM3_MAXSIZE` | `0` (disabled) | default-off | Absolute cap on SAM3 input's longer edge. Flipped `1536→0` 2026-08-18 to keep `SPAG_SAM3_BF16` solo — see project CLAUDE.md. |
+| `SPAG_SAM3_SCALE` | `1.0` | opt-in | Downscale factor for the SAM3 segmentation pass input. Renamed from `SPAG_SAM3_SCALE_DISABLE` in this plan (Task 5) to match its actual usage everywhere else in code comments and docs. Superseded by `SPAG_SAM3_MAXSIZE` as the preferred resolution lever — see project CLAUDE.md. |
+| `SPAG_SAM3_MAXSIZE` | `2048` | default-on | Absolute cap on SAM3 input's longer edge. Was `0`→disabled 2026-08-18 to keep `SPAG_SAM3_BF16` solo (1536 stack regressed); changed to `2048` 2026-09-04, stacked with `SPAG_SAM3_BF16=1` — pending formal MattSwift IoU re-validation, see project CLAUDE.md. |
 | `SPAG_TRACK_DEDUP_GAP` | `40` | opt-in | Track-dedup temporal gap threshold. |
 | `SPAG_TRACK_DEDUP_OVERLAP` | `0.6` | opt-in | Track-dedup overlap threshold. |
 | `SPAG_TRACK_DEDUP_SIZE_RATIO` | `0.3` | opt-in | Track-dedup size-ratio threshold. |
