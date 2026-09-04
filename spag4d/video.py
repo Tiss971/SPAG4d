@@ -421,15 +421,6 @@ def run_video(
             HxWx2 float32, native res, for idx>=1) for downstream velocity
             supervision -- see .claude/D1_FUTURE_WORK_PLAN.md.
     """
-    # fix #3 (docs/BGLOCK_MASKSCOPE_FIX2_APPLYEVERYWHERE.md "Next steps"): let
-    # bg_lock_dilate_px/bg_lock_feather_px be retuned without a code edit, since
-    # neither had a CLI/env knob before. Caller-supplied kwargs still win; env
-    # only overrides the function defaults (12/9) when the caller left them unset.
-    if bg_lock_dilate_px == 12 and os.environ.get("SPAG_BGLOCK_DILATE_PX"):
-        bg_lock_dilate_px = int(os.environ["SPAG_BGLOCK_DILATE_PX"])
-    if bg_lock_feather_px == 9 and os.environ.get("SPAG_BGLOCK_FEATHER_PX"):
-        bg_lock_feather_px = int(os.environ["SPAG_BGLOCK_FEATHER_PX"])
-
     if depth_correction not in ("affine", "bglock"):
         raise ValueError(f"depth_correction must be 'affine' or 'bglock', got {depth_correction!r}")
     if freeze_bg_live_color and not freeze_bg:
@@ -2599,7 +2590,7 @@ def segment_with_flows(
     # REGISTRATION anchor is coincident with another's (confirmed on
     # MattSwift). Compare FIRST/LAST occurrences instead of whole trajectories,
     # gated by a frame-gap cap so unrelated objects aren't fused.
-    reid_max_gap = int(os.environ.get("SPAG_TRACK_REID_MAX_GAP", "40"))
+    reid_max_gap = 40
     for a in range(n_tracks):
         seen_a = sorted(active_tracks[a]['seen'], key=lambda s: s['idx'])
         if not seen_a:

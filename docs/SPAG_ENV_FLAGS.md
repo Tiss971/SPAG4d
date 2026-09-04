@@ -20,9 +20,7 @@ Status legend:
 | Flag | Default | Status | Notes |
 |---|---|---|---|
 | `SPAG_LOCK_ACTIVITY` | `1` | default-on | Bg-lock composite keys off `sam_mask` alone, not the fused SAM\|activity mask. Shipped 2026-07-28, see project CLAUDE.md. |
-| `SPAG_BGLOCK_DILATE_PX` | `12` | opt-in | Overrides bg-lock dilation px, only applied if changed from default. |
-| `SPAG_BGLOCK_FEATHER_PX` | `9` | opt-in | Overrides bg-lock feather px, only applied if changed from default. |
-| `SPAG_BGLOCK_NOFLOW` | `0` | opt-in | Disables flow use in bg-lock. |
+| `SPAG_BGLOCK_NOFLOW` | `0` | opt-in | Disables flow use in bg-lock. Being benchmarked 2026-09-04 against default-flow to decide keep-vs-hardcode. |
 | `SPAG_BGLOCK_NOFLOW_BLEND` | `0.5` | opt-in | Blend factor for no-flow bg-lock mode. |
 | `SPAG_DREF_MIN_SAMPLES` | `0` | opt-in | Min sample threshold for depth-reference. See `docs/bglock_open_questions.md` §5. |
 | `SPAG_HARD_DEPTH_CUTOVER` | `0` | opt-in | Hard cutover mode for depth compositing. See `docs/bglock_open_questions.md` §8.1. |
@@ -78,17 +76,19 @@ run through the golden regression harness on a track-dedup-heavy clip
 | Flag | Default | Status | Notes |
 |---|---|---|---|
 | `SPAG_TRACK_DEDUP_PROFILE` | `default` | opt-in | Sets all 5 dedup thresholds (GAP=40, OVERLAP=0.6, SIZE_RATIO=0.3, MIN_COOCCUR=2, IDX_TOL=3 for `default`). See note above. |
-| `SPAG_TRACK_REID_MAX_GAP` | `40` | opt-in | Max frame gap for track re-identification via anchor proximity. Different mechanism (anchor-proximity re-ID, not fragment-fusion dedup) — not part of the profile. |
 
-## Deleted flags (removed 2026-09-04, folded into `SPAG_TRACK_DEDUP_PROFILE`)
+## Deleted flags
 
 | Flag | Was | Removed because |
 |---|---|---|
-| `SPAG_TRACK_DEDUP_GAP` | opt-in, `40` | Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
-| `SPAG_TRACK_DEDUP_OVERLAP` | opt-in, `0.6` | Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
-| `SPAG_TRACK_DEDUP_SIZE_RATIO` | opt-in, `0.3` | Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
-| `SPAG_TRACK_DEDUP_MIN_COOCCUR` | opt-in, `2` | Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
-| `SPAG_TRACK_DEDUP_IDX_TOL` | opt-in, `3` | Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
+| `SPAG_TRACK_DEDUP_GAP` | opt-in, `40` | 2026-09-04. Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
+| `SPAG_TRACK_DEDUP_OVERLAP` | opt-in, `0.6` | 2026-09-04. Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
+| `SPAG_TRACK_DEDUP_SIZE_RATIO` | opt-in, `0.3` | 2026-09-04. Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
+| `SPAG_TRACK_DEDUP_MIN_COOCCUR` | opt-in, `2` | 2026-09-04. Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
+| `SPAG_TRACK_DEDUP_IDX_TOL` | opt-in, `3` | 2026-09-04. Folded into `SPAG_TRACK_DEDUP_PROFILE`'s preset table; no per-value override kept. |
+| `SPAG_BGLOCK_DILATE_PX` | opt-in, `12` | 2026-09-04. Zero references anywhere outside this doc (no script/benchmark ever set it); hardcoded to `12` as the `bg_lock_dilate_px` kwarg default in `spag4d/video.py`, env override removed. Still tunable via that kwarg for one-off calls. |
+| `SPAG_BGLOCK_FEATHER_PX` | opt-in, `9` | 2026-09-04. Same as above — hardcoded to `9` as the `bg_lock_feather_px` kwarg default, env override removed. |
+| `SPAG_TRACK_REID_MAX_GAP` | opt-in, `40` | 2026-09-04. Zero references outside this doc; hardcoded to `40` in `spag4d/video.py`, env override removed. |
 
 ## Occlusion handling (FB-consistency gate)
 
